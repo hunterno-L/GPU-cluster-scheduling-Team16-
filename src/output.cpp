@@ -1,10 +1,10 @@
-﻿#include "output.h"
+#include "output.h"
 
 #include <algorithm>
 
 using namespace std;
 
-bool recordByJobId(const ScheduleRecord &a, const ScheduleRecord &b) {
+static bool recordByJobId(const ScheduleRecord &a, const ScheduleRecord &b) {
     return a.job_id < b.job_id;
 }
 
@@ -20,4 +20,3 @@ void writeScheduleRecords(ostream &output, const vector<ScheduleRecord> &records
                << record.finish_time << '\n';
     }
 }
-

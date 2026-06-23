@@ -1,4 +1,4 @@
-﻿#ifndef GPU_SCHEDULING_PARSER_H
+#ifndef GPU_SCHEDULING_PARSER_H
 #define GPU_SCHEDULING_PARSER_H
 
 #include <istream>
@@ -10,4 +10,3 @@
 std::pair<std::vector<ServerSpec>, std::vector<Job>> readInstance(std::istream &input);
 
 #endif
-

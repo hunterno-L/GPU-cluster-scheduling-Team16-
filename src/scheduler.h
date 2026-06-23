@@ -1,59 +1,54 @@
-﻿#ifndef GPU_SCHEDULING_SCHEDULER_H
+#ifndef GPU_SCHEDULING_SCHEDULER_H
 #define GPU_SCHEDULING_SCHEDULER_H
-
 #include <queue>
+#include <string>
 #include <unordered_map>
 #include <vector>
-
 #include "machine_state.h"
 #include "models.h"
 
 struct FinishEvent {
-    long long finish_time;
-    int server_id;
-    int job_id;
-    RunningJob running_job;
-
+    long long finish_time; int server_id; int job_id; RunningJob running_job;
     bool operator>(const FinishEvent &other) const;
 };
-
-class GreedyScheduler {
-public:
-    GreedyScheduler(std::vector<ServerSpec> input_servers, std::vector<Job> input_jobs);
-
-    std::vector<ScheduleRecord> schedule();
-
-private:
-    struct StartResult {
-        bool has_value = false;
-        ScheduleRecord record{};
-        RunningJob running_job{};
-    };
-
-    void buildFeasibleMachines();
-    void releaseFinishedJobs(
-        long long current_time,
-        std::priority_queue<FinishEvent, std::vector<FinishEvent>, std::greater<FinishEvent>> &running_heap
-    );
-    void tryStartPendingJobs(
-        std::queue<Job> &pending_jobs,
-        long long current_time,
-        std::unordered_map<int, ScheduleRecord> &records,
-        std::priority_queue<FinishEvent, std::vector<FinishEvent>, std::greater<FinishEvent>> &running_heap
-    );
-    StartResult tryStartOneJob(const Job &job, long long current_time);
-    long long nextEventTime(
-        long long current_time,
-        int next_job_index,
-        const std::priority_queue<FinishEvent, std::vector<FinishEvent>, std::greater<FinishEvent>> &running_heap
-    ) const;
-
-    std::vector<ServerSpec> servers;
-    std::vector<Job> jobs;
-    std::vector<MachineState> machines;
-    std::unordered_map<int, int> machine_index_by_id;
-    std::unordered_map<int, std::vector<std::pair<int, int>>> feasible_machines;
+struct ReadyJob {
+    int job_index; double priority; int feasible_count; int duration; int job_id;
+};
+struct ReadyJobCompare {
+    bool operator()(const ReadyJob &le, const ReadyJob &ri) const;
 };
 
+#ifndef FLEX_W
+#define FLEX_W 2.0
+#endif
+#ifndef SLACK_W
+#define SLACK_W 0.6
+#endif
+#ifndef WASTE_W
+#define WASTE_W 0.25
 #endif
 
+class SchedulerEngine {
+public:
+    SchedulerEngine(const std::vector<ServerSpec>&, const std::vector<Job>&,
+        bool(*cmp)(const Job&,const Job&)=nullptr, const std::string& ="best-fit", bool bf=false);
+    std::unordered_map<int,ScheduleRecord> schedule();
+    static int totalWeight(const std::unordered_map<int,ScheduleRecord>&, const std::vector<Job>&);
+private:
+    using FH = std::priority_queue<FinishEvent,std::vector<FinishEvent>,std::greater<FinishEvent>>;
+    using RH = std::priority_queue<ReadyJob,std::vector<ReadyJob>,ReadyJobCompare>;
+    struct SR { bool ok=false; ScheduleRecord rec{}; RunningJob rj{}; };
+    void buildFeasible();
+    // Inlined cost computation (no vtable dispatch)
+    inline double cost(int mi, const Job &j, int g) const;
+    SR tryOne(const Job&,long long);
+    void rel(long long,FH&); int dlimit(int)const; long long nt(long long,int,const FH&)const;
+    std::vector<MachineState> ms; std::unordered_map<int,int> mi;
+    std::vector<Job> jobs; std::unordered_map<int,std::vector<std::pair<int,int>>> fe;
+    std::vector<int> mf;        // machine_flex (static count of feasible jobs per machine)
+    std::vector<double> mfi;    // precomputed: mf[i] * flex_inv (cached flexibility ratio)
+    double flex_inv;            // 1.0 / max(jobs.size(),1)
+    bool bf;
+};
+SchedulerEngine makeOpt(const std::vector<ServerSpec>&, const std::vector<Job>&);
+#endif

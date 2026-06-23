@@ -1,4 +1,4 @@
-﻿#ifndef GPU_SCHEDULING_MODELS_H
+#ifndef GPU_SCHEDULING_MODELS_H
 #define GPU_SCHEDULING_MODELS_H
 
 struct ServerSpec {
@@ -38,4 +38,3 @@ struct ScheduleRecord {
 };
 
 #endif
-

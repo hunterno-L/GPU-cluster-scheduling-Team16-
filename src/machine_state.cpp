@@ -1,4 +1,6 @@
-﻿#include "machine_state.h"
+#include "machine_state.h"
+
+#include <algorithm>
 
 using namespace std;
 
@@ -6,6 +8,9 @@ MachineState::MachineState(ServerSpec server) : spec(server) {
     remaining_gpu = spec.gpu_count;
     remaining_cpu = spec.cpu_cores;
     remaining_memory = spec.memory;
+    inv_gpu_count  = spec.gpu_count  > 0 ? 1.0 / spec.gpu_count  : 0;
+    inv_cpu_cores  = spec.cpu_cores  > 0 ? 1.0 / spec.cpu_cores  : 0;
+    inv_memory     = spec.memory     > 0 ? 1.0 / spec.memory     : 0;
 }
 
 int MachineState::requiredGpuCount(const Job &job) const {
@@ -67,3 +72,9 @@ void MachineState::releaseJob(const RunningJob &running_job) {
     running_jobs = remaining;
 }
 
+double MachineState::placementSlack(const Job &job, int gpu_used) const {
+    double gs = (double)(remaining_gpu - gpu_used) * inv_gpu_count;
+    double cs = (double)(remaining_cpu - job.cpu_cores) * inv_cpu_cores;
+    double ms = (double)(remaining_memory - job.memory) * inv_memory;
+    return (gs + cs + ms) / 3.0;
+}
