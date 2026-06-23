@@ -21,6 +21,15 @@ bool FinishEvent::operator>(const FinishEvent &other) const {
     return job_id > other.job_id;
 }
 
+bool ReadyJobCompare::operator()(const ReadyJob &left, const ReadyJob &right) const {
+    if (left.priority != right.priority) return left.priority < right.priority;
+    if (left.feasible_machine_count != right.feasible_machine_count) {
+        return left.feasible_machine_count > right.feasible_machine_count;
+    }
+    if (left.duration != right.duration) return left.duration < right.duration;
+    return left.job_id > right.job_id;
+}
+
 GreedyScheduler::GreedyScheduler(vector<ServerSpec> input_servers, vector<Job> input_jobs)
     : servers(move(input_servers)), jobs(move(input_jobs)) {
     sort(servers.begin(), servers.end(), compareServerById);
@@ -43,7 +52,7 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
 
     long long current_time = jobs.front().release_time;
     int next_job_index = 0;
-    queue<Job> pending_jobs;
+    priority_queue<ReadyJob, vector<ReadyJob>, ReadyJobCompare> pending_jobs;
     unordered_map<int, ScheduleRecord> records;
     priority_queue<FinishEvent, vector<FinishEvent>, greater<FinishEvent>> running_heap;
 
@@ -52,7 +61,7 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
 
         while (next_job_index < static_cast<int>(jobs.size()) &&
                jobs[next_job_index].release_time <= current_time) {
-            pending_jobs.push(jobs[next_job_index]);
+            pending_jobs.push(makeReadyJob(next_job_index));
             ++next_job_index;
         }
 
@@ -74,6 +83,8 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
 }
 
 void GreedyScheduler::buildFeasibleMachines() {
+    machine_flexibility.assign(machines.size(), 0);
+
     for (const auto &job : jobs) {
         vector<pair<int, int>> entries;
 
@@ -89,6 +100,9 @@ void GreedyScheduler::buildFeasibleMachines() {
         }
 
         feasible_machines[job.job_id] = entries;
+        for (const auto &entry : entries) {
+            ++machine_flexibility[entry.first];
+        }
     }
 }
 
@@ -106,19 +120,28 @@ void GreedyScheduler::releaseFinishedJobs(
 }
 
 void GreedyScheduler::tryStartPendingJobs(
-    queue<Job> &pending_jobs,
+    priority_queue<ReadyJob, vector<ReadyJob>, ReadyJobCompare> &pending_jobs,
     long long current_time,
     unordered_map<int, ScheduleRecord> &records,
     priority_queue<FinishEvent, vector<FinishEvent>, greater<FinishEvent>> &running_heap
 ) {
-    while (!pending_jobs.empty()) {
-        Job job = pending_jobs.front();
+    const int attempt_limit = dispatchAttemptLimit(static_cast<int>(pending_jobs.size()));
+    vector<ReadyJob> deferred;
+    deferred.reserve(min(attempt_limit, static_cast<int>(pending_jobs.size())));
+
+    int attempts = 0;
+    while (!pending_jobs.empty() && attempts < attempt_limit) {
+        ReadyJob ready_job = pending_jobs.top();
+        pending_jobs.pop();
+        ++attempts;
+
+        const Job &job = jobs[ready_job.job_index];
         auto started = tryStartOneJob(job, current_time);
         if (!started.has_value) {
-            break;
+            deferred.push_back(ready_job);
+            continue;
         }
 
-        pending_jobs.pop();
         records[job.job_id] = started.record;
         running_heap.push(
             FinishEvent{
@@ -129,19 +152,63 @@ void GreedyScheduler::tryStartPendingJobs(
             }
         );
     }
+
+    for (const ReadyJob &ready_job : deferred) {
+        pending_jobs.push(ready_job);
+    }
 }
 
 GreedyScheduler::StartResult GreedyScheduler::tryStartOneJob(const Job &job, long long current_time) {
     const vector<pair<int, int>> &entries = feasible_machines.at(job.job_id);
-    for (size_t idx = 0; idx < entries.size(); ++idx) {
-        int machine_index = entries[idx].first;
-        int gpu_used = entries[idx].second;
-        if (machines[machine_index].canStart(job, gpu_used)) {
-            pair<ScheduleRecord, RunningJob> result = machines[machine_index].startJob(job, current_time, gpu_used);
-            return StartResult{true, result.first, result.second};
+    int best_machine_index = -1;
+    int best_gpu_used = 0;
+    double best_cost = 0.0;
+
+    for (const auto &entry : entries) {
+        const int machine_index = entry.first;
+        const int gpu_used = entry.second;
+        const MachineState &machine = machines[machine_index];
+        if (!machine.canStart(job, gpu_used)) {
+            continue;
+        }
+
+        const double flexibility = static_cast<double>(machine_flexibility[machine_index]) / jobs.size();
+        const double gpu_memory_waste = static_cast<double>(gpu_used * machine.spec.gpu_memory - job.gpu_memory) /
+                                        (gpu_used * machine.spec.gpu_memory);
+        const double cost = 2.0 * flexibility + 0.60 * machine.placementSlack(job, gpu_used) +
+                            0.25 * gpu_memory_waste;
+
+        if (best_machine_index == -1 || cost < best_cost ||
+            (cost == best_cost && machine.spec.server_id < machines[best_machine_index].spec.server_id)) {
+            best_machine_index = machine_index;
+            best_gpu_used = gpu_used;
+            best_cost = cost;
         }
     }
+
+    if (best_machine_index != -1) {
+        pair<ScheduleRecord, RunningJob> result =
+            machines[best_machine_index].startJob(job, current_time, best_gpu_used);
+        return StartResult{true, result.first, result.second};
+    }
+
     return StartResult{};
+}
+
+ReadyJob GreedyScheduler::makeReadyJob(int job_index) const {
+    const Job &job = jobs[job_index];
+    const int feasible_machine_count = static_cast<int>(feasible_machines.at(job.job_id).size());
+    const double priority = 1000000.0 * job.weight / job.duration;
+    return ReadyJob{job_index, priority, feasible_machine_count, job.duration, job.job_id};
+}
+
+int GreedyScheduler::dispatchAttemptLimit(int ready_job_count) const {
+    if (ready_job_count == 0) {
+        return 0;
+    }
+
+    const int capacity_based_limit = max(256, static_cast<int>(machines.size()) * 8);
+    return min(ready_job_count, min(2048, capacity_based_limit));
 }
 
 long long GreedyScheduler::nextEventTime(
@@ -174,4 +241,3 @@ long long GreedyScheduler::nextEventTime(
 
     return next_time;
 }
-

@@ -17,6 +17,18 @@ struct FinishEvent {
     bool operator>(const FinishEvent &other) const;
 };
 
+struct ReadyJob {
+    int job_index;
+    double priority;
+    int feasible_machine_count;
+    int duration;
+    int job_id;
+};
+
+struct ReadyJobCompare {
+    bool operator()(const ReadyJob &left, const ReadyJob &right) const;
+};
+
 class GreedyScheduler {
 public:
     GreedyScheduler(std::vector<ServerSpec> input_servers, std::vector<Job> input_jobs);
@@ -36,12 +48,14 @@ private:
         std::priority_queue<FinishEvent, std::vector<FinishEvent>, std::greater<FinishEvent>> &running_heap
     );
     void tryStartPendingJobs(
-        std::queue<Job> &pending_jobs,
+        std::priority_queue<ReadyJob, std::vector<ReadyJob>, ReadyJobCompare> &pending_jobs,
         long long current_time,
         std::unordered_map<int, ScheduleRecord> &records,
         std::priority_queue<FinishEvent, std::vector<FinishEvent>, std::greater<FinishEvent>> &running_heap
     );
     StartResult tryStartOneJob(const Job &job, long long current_time);
+    ReadyJob makeReadyJob(int job_index) const;
+    int dispatchAttemptLimit(int ready_job_count) const;
     long long nextEventTime(
         long long current_time,
         int next_job_index,
@@ -53,7 +67,7 @@ private:
     std::vector<MachineState> machines;
     std::unordered_map<int, int> machine_index_by_id;
     std::unordered_map<int, std::vector<std::pair<int, int>>> feasible_machines;
+    std::vector<int> machine_flexibility;
 };
 
 #endif
-

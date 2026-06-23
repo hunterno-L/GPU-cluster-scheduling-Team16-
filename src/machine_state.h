@@ -13,6 +13,7 @@ public:
     int requiredGpuCount(const Job &job) const;
     bool canEverRun(const Job &job, int gpu_used) const;
     bool canStart(const Job &job, int gpu_used) const;
+    double placementSlack(const Job &job, int gpu_used) const;
     std::pair<ScheduleRecord, RunningJob> startJob(const Job &job, long long current_time, int gpu_used);
     void releaseJob(const RunningJob &running_job);
 
@@ -26,4 +27,3 @@ private:
 };
 
 #endif
-

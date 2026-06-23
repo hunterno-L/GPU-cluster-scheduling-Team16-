@@ -25,6 +25,13 @@ bool MachineState::canStart(const Job &job, int gpu_used) const {
            job.memory <= remaining_memory;
 }
 
+double MachineState::placementSlack(const Job &job, int gpu_used) const {
+    const double gpu_slack = static_cast<double>(remaining_gpu - gpu_used) / spec.gpu_count;
+    const double cpu_slack = static_cast<double>(remaining_cpu - job.cpu_cores) / spec.cpu_cores;
+    const double memory_slack = static_cast<double>(remaining_memory - job.memory) / spec.memory;
+    return gpu_slack + cpu_slack + memory_slack;
+}
+
 pair<ScheduleRecord, RunningJob> MachineState::startJob(const Job &job, long long current_time, int gpu_used) {
     long long finish_time = current_time + job.duration;
 
@@ -66,4 +73,3 @@ void MachineState::releaseJob(const RunningJob &running_job) {
     }
     running_jobs = remaining;
 }
-
