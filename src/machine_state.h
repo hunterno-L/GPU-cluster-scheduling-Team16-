@@ -1,4 +1,4 @@
-﻿#ifndef GPU_SCHEDULING_MACHINE_STATE_H
+#ifndef GPU_SCHEDULING_MACHINE_STATE_H
 #define GPU_SCHEDULING_MACHINE_STATE_H
 
 #include <utility>
@@ -16,6 +16,10 @@ public:
     std::pair<ScheduleRecord, RunningJob> startJob(const Job &job, long long current_time, int gpu_used);
     void releaseJob(const RunningJob &running_job);
 
+    int getRemainingGPU() const { return remaining_gpu; }
+    int getRemainingCPU() const { return remaining_cpu; }
+    int getRemainingMemory() const { return remaining_memory; }
+
     ServerSpec spec;
 
 private:
@@ -26,4 +30,3 @@ private:
 };
 
 #endif
-
