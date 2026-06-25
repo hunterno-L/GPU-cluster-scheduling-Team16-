@@ -1,4 +1,6 @@
-﻿#include "machine_state.h"
+#include "machine_state.h"
+
+#include <algorithm>
 
 using namespace std;
 
@@ -23,6 +25,21 @@ bool MachineState::canStart(const Job &job, int gpu_used) const {
     return gpu_used <= remaining_gpu &&
            job.cpu_cores <= remaining_cpu &&
            job.memory <= remaining_memory;
+}
+
+double MachineState::placementSlack(const Job &job, int gpu_used) const {
+    const double gpu_slack = static_cast<double>(remaining_gpu - gpu_used) / spec.gpu_count;
+    const double cpu_slack = static_cast<double>(remaining_cpu - job.cpu_cores) / spec.cpu_cores;
+    const double memory_slack = static_cast<double>(remaining_memory - job.memory) / spec.memory;
+    return gpu_slack + cpu_slack + memory_slack;
+}
+
+double MachineState::postPlacementImbalance(const Job &job, int gpu_used) const {
+    const double gpu_residual = static_cast<double>(remaining_gpu - gpu_used) / spec.gpu_count;
+    const double cpu_residual = static_cast<double>(remaining_cpu - job.cpu_cores) / spec.cpu_cores;
+    const double memory_residual = static_cast<double>(remaining_memory - job.memory) / spec.memory;
+    return std::max({gpu_residual, cpu_residual, memory_residual}) -
+           std::min({gpu_residual, cpu_residual, memory_residual});
 }
 
 pair<ScheduleRecord, RunningJob> MachineState::startJob(const Job &job, long long current_time, int gpu_used) {
@@ -66,4 +83,3 @@ void MachineState::releaseJob(const RunningJob &running_job) {
     }
     running_jobs = remaining;
 }
-
