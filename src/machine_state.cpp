@@ -9,14 +9,27 @@ MachineState::MachineState(ServerSpec server) : spec(server) {
 }
 
 int MachineState::requiredGpuCount(const Job &job) const {
-    int gpu_for_memory = (job.gpu_memory + spec.gpu_memory - 1) / spec.gpu_memory;
+    // 约定：spec.gpu_memory 表示“单卡显存”，job.gpu_memory 为任务总显存需求
+    int memory_per_gpu = spec.gpu_memory;
+    if (memory_per_gpu <= 0) memory_per_gpu = 1;
+
+    // 计算需要多少GPU才能满足显存需求
+    int gpu_for_memory = (job.gpu_memory + memory_per_gpu - 1) / memory_per_gpu;
     return max(job.min_gpu, gpu_for_memory);
 }
 
 bool MachineState::canEverRun(const Job &job, int gpu_used) const {
-    return gpu_used <= spec.gpu_count &&
-           job.cpu_cores <= spec.cpu_cores &&
-           job.memory <= spec.memory;
+    if (gpu_used <= 0 || gpu_used > spec.gpu_count) return false;
+    if (job.cpu_cores > spec.cpu_cores) return false;
+    if (job.memory > spec.memory) return false;
+
+    // 检查显存：job需要的显存必须能装在gpu_used个GPU上
+    int memory_per_gpu = spec.gpu_memory;
+    if (memory_per_gpu <= 0) memory_per_gpu = 1;
+    int total_available = memory_per_gpu * gpu_used;
+    if (job.gpu_memory > total_available) return false;
+
+    return true;
 }
 
 bool MachineState::canStart(const Job &job, int gpu_used) const {
