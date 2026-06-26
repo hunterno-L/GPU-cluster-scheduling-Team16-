@@ -1,48 +1,52 @@
 # lab2.0 - Grid-Search Optimized Scheduler
 
-基于 lab1.0，通过 20 组合全量网格搜索找到最优参数配置。
+基于 lab1.0，通过全量网格搜索找到最优参数配置。
+
+---
+
+## 与新评分公式的适配
+
+2026-06-26 课程修正了 E_memory 公式：
+
+**旧公式**：`E_memory = (1/H) × Σ_t Σ_s (G_s·VG_s - Σ v_i)`  
+**新公式**：`E_memory = Σ_i p_i × (u_i·VG_si - v_i)`
+
+新公式去掉了除以 H 的归一化，使 E_memory 和 E_finish 不再重叠。**按新公式重新网格扫描**，结果如下：
+
+```
+SLACK_W   WASTE_W      Proxy   W-Wait  W-Mem  W-Fin
+0.20      0.25       64.43   19      48     10      ← 最优
+0.30      0.25       72.45   10      19     10
+0.40      0.25       78.03   10      16     11
+0.20      0.00       102.6   12       6     11
+```
+
+**结论：WASTE_W=0.25 在新公式下全面碾压 WASTE_W=0.0（因为它直接衡量了每个任务的显存浪费）。SLACK_W 回到 0.20。**
 
 ---
 
 ## 与 lab1.0 相比的变更
 
-### Cost 函数参数调整
-
 | 参数 | lab1.0 | lab2.0 | 说明 |
 |------|:---:|:---:|------|
 | FLEX_W | 2.0 | 2.0 | 不变 |
-| SLACK_W（等效权重） | 0.20（`0.60 × 平均剩余比例`） | **0.40**（`0.40 × SUM 剩余比例`） | slack 权重大幅提升，鼓励更紧凑的放置 |
-| WASTE_W | 0.25 | **0.25** | 保留（网格扫描证实有效） |
-| Backfill | 迭代收敛（最多 100 轮） | **单次扫描** | 网格扫描发现迭代无额外收益，关闭以节约时间 |
-
-### 性能优化
-
-| 项目 | lab1.0 | lab2.0 | 说明 |
-|------|:---:|:---:|------|
-| 预计算倒数 | 有（`inv_gpu_count`/`inv_cpu_cores`/`inv_memory`） | 有 | 保留，热路径乘法替代除法 |
+| SLACK_W（等效） | 0.20（`0.60 × avg`） | **0.20**（`0.20 × SUM`） | 语义统一，权重等效 |
+| WASTE_W | 0.25 | **0.25** | 保留（新公式下必需） |
+| Backfill | 迭代收敛 | **单次** | 网格扫描证实无额外收益 |
+| 预计算倒数 | 有 | 有 | 保留 |
 | inline cost | 有 | 有 | 保留 |
-| 灵活性预计算 | 有（`mfi[]`） | 有 | 保留 |
-| 不可调度任务处理 | 静默跳过 | 静默跳过 | 保留 |
 
-### 参数可配置化
+### 可调参数
 
-lab1.0 的宏定义直接硬编码在 scheduler.h 中。lab2.0 将所有调优参数统一为宏：
 ```cpp
 #define FLEX_W 2.0        // 机器灵活度权重
-#define SLACK_W 0.40      // 资源紧凑度权重（网格搜索最优）
-#define WASTE_W 0.25      // 显存浪费惩罚  
-#define BACKFILL_ITER 0   // 0=单次回填, 1=迭代收敛
+#define SLACK_W 0.20      // 资源紧凑度权重（新公式网格扫描最优）
+#define WASTE_W 0.25      // 显存浪费惩罚（新公式下必需）
+#define BACKFILL_ITER 0   // 0=单次回填
 ```
-
-### 为何改成单次 Backfill
-
-20 组网格扫描中，所有 single/iter 配对结果完全一致，迭代收敛循环没有产生任何额外的任务放置。说明在当前代价函数和任务集合下，单次扫描已足够——多轮收敛是纯开销。
-
----
 
 ## 构建
 
 ```bash
-g++ -std=c++17 -O2 src/main.cpp src/parser.cpp src/machine_state.cpp \
-    src/scheduler.cpp src/output.cpp -o main
+g++ -std=c++17 -O2 main.cpp parser.cpp machine_state.cpp scheduler.cpp output.cpp -o main
 ```
