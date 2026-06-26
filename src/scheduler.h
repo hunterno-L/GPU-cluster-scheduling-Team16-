@@ -23,7 +23,7 @@ struct ReadyJobCompare {
 #define FLEX_W 2.0
 #endif
 #ifndef SLACK_W
-#define SLACK_W 0.20
+#define SLACK_W 0.00
 #endif
 #ifndef WASTE_W
 #define WASTE_W 0.25    // 0.0=off; 0.25 matches scheduler-optimization1.0
