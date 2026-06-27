@@ -1,4 +1,4 @@
-﻿#include <iostream>
+#include <iostream>
 
 #include "output.h"
 #include "parser.h"
@@ -17,10 +17,9 @@ int main() {
         return 0;
     }
 
-    GreedyScheduler scheduler(servers, jobs);
+    GreedyScheduler scheduler(servers, jobs, BACKFILL_ITER != 0);
     vector<ScheduleRecord> records = scheduler.schedule();
     writeScheduleRecords(cout, records);
 
     return 0;
 }
-

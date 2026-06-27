@@ -1,4 +1,4 @@
-﻿#include "machine_state.h"
+#include "machine_state.h"
 
 using namespace std;
 
@@ -23,6 +23,15 @@ bool MachineState::canStart(const Job &job, int gpu_used) const {
     return gpu_used <= remaining_gpu &&
            job.cpu_cores <= remaining_cpu &&
            job.memory <= remaining_memory;
+}
+
+double MachineState::placementSlack(const Job &job, int gpu_used, double gpu_emphasis) const {
+    double gs = spec.gpu_count > 0 ? (double)(remaining_gpu - gpu_used) / spec.gpu_count : 0.0;
+    double cs = spec.cpu_cores > 0 ? (double)(remaining_cpu - job.cpu_cores) / spec.cpu_cores : 0.0;
+    double ms = spec.memory > 0 ? (double)(remaining_memory - job.memory) / spec.memory : 0.0;
+    gpu_emphasis = max(0.2, min(0.65, gpu_emphasis));
+    double other = (1.0 - gpu_emphasis) * 0.5;
+    return gpu_emphasis * gs + other * cs + other * ms;
 }
 
 pair<ScheduleRecord, RunningJob> MachineState::startJob(const Job &job, long long current_time, int gpu_used) {
@@ -66,4 +75,3 @@ void MachineState::releaseJob(const RunningJob &running_job) {
     }
     running_jobs = remaining;
 }
-
