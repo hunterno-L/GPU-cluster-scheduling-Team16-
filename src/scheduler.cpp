@@ -924,76 +924,6 @@ bool GreedyScheduler::isBetterOfficialSolution(const Solution &candidate, const 
 
 void GreedyScheduler::computeOfficialMetrics(Solution &sol) const {
     computeMetrics(sol);
-
-    if (sol.records.empty()) return;
-
-    unordered_map<int, const Job *> job_map;
-    for (const auto &job : jobs) job_map[job.job_id] = &job;
-
-    long long makespan = static_cast<long long>(sol.makespan);
-    long long t0 = jobs.front().release_time;
-
-    struct VramEvent {
-        long long time;
-        int server_index;
-        int delta;
-        bool operator<(const VramEvent &other) const {
-            if (time != other.time) return time < other.time;
-            return delta < other.delta;
-        }
-    };
-    vector<VramEvent> events;
-    events.reserve(sol.records.size() * 2);
-    for (const auto &rec : sol.records) {
-        auto job_it = job_map.find(rec.job_id);
-        auto mach_it = machine_index_by_id.find(rec.server_id);
-        if (job_it == job_map.end() || mach_it == machine_index_by_id.end()) continue;
-        int sid = mach_it->second;
-        int vram = job_it->second->gpu_memory;
-        events.push_back({rec.start_time, sid, +vram});
-        events.push_back({rec.finish_time, sid, -vram});
-    }
-    sort(events.begin(), events.end());
-
-    vector<long long> capacity(machines.size());
-    vector<long long> used(machines.size(), 0);
-    for (size_t i = 0; i < machines.size(); ++i) {
-        capacity[i] = (long long)machines[i].spec.gpu_count * machines[i].spec.gpu_memory;
-    }
-
-    long long prev_t = t0;
-    long long idle_integral = 0;
-    size_t idx = 0;
-    while (idx < events.size()) {
-        long long t = events[idx].time;
-        if (t > prev_t) {
-            long long seg_idle = 0;
-            for (size_t i = 0; i < machines.size(); ++i) {
-                seg_idle += max(0LL, capacity[i] - used[i]);
-            }
-            idle_integral += seg_idle * (t - prev_t);
-            prev_t = t;
-        }
-        while (idx < events.size() && events[idx].time == t) {
-            used[events[idx].server_index] += events[idx].delta;
-            ++idx;
-        }
-    }
-    if (makespan > prev_t) {
-        long long seg_idle = 0;
-        for (size_t i = 0; i < machines.size(); ++i) {
-            seg_idle += max(0LL, capacity[i] - used[i]);
-        }
-        idle_integral += seg_idle * (makespan - prev_t);
-    }
-
-    long long horizon = max(1LL, makespan - t0);
-    sol.vram_idle = (double)idle_integral / (double)horizon;
-
-    double ww_norm = sol.weighted_waiting / 1000000.0;
-    double vram_norm = sol.vram_idle / 100000.0;
-    double mk_norm = (sol.makespan - t0) / 100000.0;
-    sol.score = ww_norm + vram_norm + mk_norm;
 }
 
 void GreedyScheduler::computeMetrics(Solution &sol) const {
@@ -1027,8 +957,9 @@ void GreedyScheduler::computeMetrics(Solution &sol) const {
         total_gpu_slots += (long long)srv.gpu_count * horizon;
     }
 
-    // 显存浪费积分（轻量近似，用于多策略比较）
-    long long vram_waste_integral = 0;
+    // 修正规则允许统一权重 rho_i = 1/N：
+    // E_memory = sum_i rho_i * (u_i * VG_{s_i} - v_i)
+    long long total_vram_waste = 0;
     for (const auto &rec : sol.records) {
         auto job_it = job_map.find(rec.job_id);
         auto mach_it = machine_index_by_id.find(rec.server_id);
@@ -1037,12 +968,12 @@ void GreedyScheduler::computeMetrics(Solution &sol) const {
         int vg = machines[mach_it->second].spec.gpu_memory;
         long long allocated = (long long)rec.gpu_used * vg;
         long long waste = max(0LL, allocated - job->gpu_memory);
-        vram_waste_integral += waste * job->duration;
+        total_vram_waste += waste;
     }
 
     sol.weighted_waiting = (double)total_weighted_wait;
     sol.makespan = (double)makespan;
-    sol.vram_idle = (double)vram_waste_integral / (double)horizon;
+    sol.vram_idle = jobs.empty() ? 0.0 : (double)total_vram_waste / (double)jobs.size();
     sol.gpu_utilization = (total_gpu_slots > 0) ? (double)total_gpu_slots_used / total_gpu_slots : 0;
 
     // 与官方三项指标对齐（均越小越好）

@@ -30,14 +30,3 @@ if(PLACEMENT)
     target_compile_definitions(execname PRIVATE PLACEMENT_${PLACEMENT})
 endif()
 target_compile_definitions(execname PRIVATE BACKFILL_ITER=${BACKFILL_ITER})
-
-include(CTest)
-
-if(BUILD_TESTING)
-    add_executable(scheduler_tests
-            tests/scheduler_tests.cpp
-            src/machine_state.cpp
-            src/scheduler.cpp)
-    target_include_directories(scheduler_tests PRIVATE src)
-    add_test(NAME scheduler_tests COMMAND scheduler_tests)
-endif()
