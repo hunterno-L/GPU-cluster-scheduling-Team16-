@@ -13,6 +13,8 @@ struct FinishEvent {
 };
 struct ReadyJob {
     int job_index; double priority; int feasible_count; int duration; int job_id;
+    long long release_time;    // original arrival time (for computing waiting_time)
+    long long waiting_time;    // accumulated wait: current_time - release_time (updated on re-push)
 };
 struct ReadyJobCompare {
     bool operator()(const ReadyJob &le, const ReadyJob &ri) const;
@@ -30,6 +32,23 @@ struct ReadyJobCompare {
 #endif
 #ifndef BACKFILL_ITER
 #define BACKFILL_ITER 0  // 1=iterative, 0=single-pass
+#endif
+// Part-A tuning knobs (An's domain: job ordering/dispatch)
+#ifndef AGE_W
+#define AGE_W 0.0          // wait-time aging weight (0=off)
+#endif
+#ifndef DURATION_EXP
+#define DURATION_EXP 1.0   // exponent on duration in priority: weight/duration^exp (1.0=WSPT)
+#endif
+#ifndef HIGH_PRIORITY_BOOST
+#define HIGH_PRIORITY_BOOST 0.0  // extra boost for top-weight jobs (0=off)
+#endif
+// Part-B tuning knobs: machine selection — mem-trade-off
+#ifndef MEM_TRADE_OFF_RATIO
+#define MEM_TRADE_OFF_RATIO 1.00  // switch to alt if waste < best_waste * ratio
+#endif
+#ifndef COST_PREMIUM_RATIO
+#define COST_PREMIUM_RATIO 2.00   // allow alt only if cost <= best_cost * ratio
 #endif
 
 class SchedulerEngine {
