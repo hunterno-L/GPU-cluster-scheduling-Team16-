@@ -461,6 +461,7 @@ bool GreedyScheduler::shouldLongJobRefine() const {
 
 bool GreedyScheduler::shouldFastRefine() const {
     if (jobs.size() <= 250 || jobs.size() > 420) return false;
+    if (profile.burst_t0_ratio > 0.55 && jobs.size() > 300) return false;
     if (instanceDifficulty() > 0.40) return true;
     if (profile.release_spread_ratio > 0.50 && profile.long_job_ratio > 0.30) return true;
     if (profile.cpu_demand_ratio > 0.60 || profile.mem_demand_ratio > 0.60) return true;
@@ -932,21 +933,9 @@ GreedyScheduler::Solution GreedyScheduler::generateGreedySolutionWithStrategy(in
         }
 
         if (!deferred.empty()) {
-            if (!isMegascaleInstance() && !isLargeInstance() && jobs.size() <= 420 &&
-                (profile.burst_t0_ratio > 0.45 ||
-                 (profile.long_job_ratio > 0.38 && profile.burst_t0_ratio > 0.30))) {
-                sort(deferred.begin(), deferred.end(),
-                     [this, order_variant, &sim_machines, &current_time](const Job &a, const Job &b) {
-                    long long ea = minEarliestStartForJob(a, sim_machines, current_time);
-                    long long eb = minEarliestStartForJob(b, sim_machines, current_time);
-                    if (ea != eb) return ea < eb;
-                    return jobMoreUrgentFirst(a, b, order_variant, current_time);
-                });
-            } else {
-                sort(deferred.begin(), deferred.end(), [this](const Job &a, const Job &b) {
-                    return jobFeasibleCount(a.job_id) < jobFeasibleCount(b.job_id);
-                });
-            }
+            sort(deferred.begin(), deferred.end(), [this](const Job &a, const Job &b) {
+                return jobFeasibleCount(a.job_id) < jobFeasibleCount(b.job_id);
+            });
         }
         for (const auto &job : deferred) {
             auto it = feasible_machines.find(job.job_id);
@@ -1131,8 +1120,14 @@ GreedyScheduler::Solution GreedyScheduler::fastRefinePlacement(const Solution &i
     }
     const size_t max_try = isSingleServer() ? 10
         : (isNarrowCluster() ? 8 : ((profile.vram_pressure > 0.55) ? 6 : 5));
+    size_t try_cap = max_try;
+    size_t eval_cap = top_k;
+    if (!isSingleServer() && profile.burst_t0_ratio > 0.55 && jobs.size() > 260) {
+        eval_cap = min(eval_cap, (size_t)14);
+        try_cap = min(try_cap, (size_t)4);
+    }
 
-    for (size_t oi = 0; oi < top_k; ++oi) {
+    for (size_t oi = 0; oi < eval_cap; ++oi) {
         size_t idx = order[oi];
         int job_id = best.records[idx].job_id;
         auto job_it = job_by_id.find(job_id);
@@ -1147,7 +1142,7 @@ GreedyScheduler::Solution GreedyScheduler::fastRefinePlacement(const Solution &i
             return machines[a.first].spec.gpu_memory < machines[b.first].spec.gpu_memory;
         });
 
-        const size_t try_n = min(candidates.size(), max_try);
+        const size_t try_n = min(candidates.size(), try_cap);
         for (size_t ci = 0; ci < try_n; ++ci) {
             const auto &entry = candidates[ci];
             if (machines[entry.first].spec.server_id == best.records[idx].server_id &&
@@ -1160,8 +1155,8 @@ GreedyScheduler::Solution GreedyScheduler::fastRefinePlacement(const Solution &i
             candidate.records[idx].gpu_used = entry.second;
             replayScheduleForRefine(candidate);
             if (!isScheduleValid(candidate)) continue;
-            computeOfficialMetrics(candidate);
-            if (isBetterOfficialSolution(candidate, best)) {
+            computeMetrics(candidate);
+            if (isBetterSolution(candidate, best)) {
                 best = candidate;
             }
         }
@@ -1774,8 +1769,7 @@ GreedyScheduler::Solution GreedyScheduler::neighborhoodReassign(const Solution &
         n.records[idx].server_id = machines[it->second[choice].first].spec.server_id;
         n.records[idx].gpu_used = it->second[choice].second;
     }
-    if (shouldDualReplayInRefine()) replayScheduleAdaptive(n);
-    else replaySchedule(n);
+    replaySchedule(n);
     if (!isScheduleValid(n)) return sol;
     computeMetrics(n);
     return n;
@@ -1792,7 +1786,6 @@ void GreedyScheduler::fillReplayOrderVariants(vector<int> &out) const {
     }
     if (profile.long_job_ratio > 0.38) {
         out.push_back(2);
-        out.push_back(0);
         if (profile.long_job_ratio <= 0.42) out.push_back(1);
         return;
     }
@@ -1814,28 +1807,22 @@ void GreedyScheduler::fillReplayOrderVariants(vector<int> &out) const {
 }
 
 bool GreedyScheduler::shouldDualReplayInRefine() const {
-    if (jobs.size() > 650) return false;
-    if (isSingleServer()) return jobs.size() <= 320;
-    if (!isSingleServer() && profile.long_job_ratio > 0.42) return jobs.size() <= 420;
-    if (profile.burst_t0_ratio > 0.45) return jobs.size() <= 420;
-    if (profile.cpu_demand_ratio > 0.60 || profile.mem_demand_ratio > 0.60) {
-        return jobs.size() <= 360;
-    }
-    return jobs.size() <= 220 && instanceDifficulty() > 0.38;
+    return false;
 }
 
 bool GreedyScheduler::shouldAssignmentReplayPolish() const {
     if (jobs.size() < 40 || jobs.size() > 3500) return false;
     if (isMegascaleInstance()) return false;
-    if (!isSingleServer() && profile.long_job_ratio > 0.42) {
-        return jobs.size() <= 420;
+    if (isSingleServer()) return jobs.size() <= 400;
+    if (profile.long_job_ratio > 0.38 && profile.long_job_ratio <= 0.42 &&
+        jobs.size() <= 360) {
+        return true;
     }
-    return isSingleServer() || instanceDifficulty() >= 0.30;
+    return false;
 }
 
 void GreedyScheduler::replayScheduleForRefine(Solution &sol) {
-    if (shouldDualReplayInRefine()) replayScheduleAdaptive(sol);
-    else replayForRefine(sol);
+    replaySchedule(sol);
 }
 
 void GreedyScheduler::replayScheduleAdaptive(Solution &sol) {
@@ -1866,9 +1853,9 @@ void GreedyScheduler::replayScheduleAdaptive(Solution &sol) {
     }
 
     if (jobs.size() <= 2000) {
-        computeOfficialMetrics(wspt);
-        computeOfficialMetrics(alt_sol);
-        sol = isBetterOfficialSolution(alt_sol, wspt) ? alt_sol : wspt;
+        computeMetrics(wspt);
+        computeMetrics(alt_sol);
+        sol = isBetterSolution(alt_sol, wspt) ? alt_sol : wspt;
     } else {
         computeMetrics(wspt);
         computeMetrics(alt_sol);

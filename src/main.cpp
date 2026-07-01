@@ -17,7 +17,7 @@ int main() {
         return 0;
     }
 
-    GreedyScheduler scheduler(servers, jobs, BACKFILL_ITER != 0);
+    GreedyScheduler scheduler(servers, jobs);
     vector<ScheduleRecord> records = scheduler.schedule();
     writeScheduleRecords(cout, records);
 
