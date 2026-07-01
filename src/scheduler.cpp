@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <limits>
 #include <stdexcept>
 #include <cstdlib>
 #include <ctime>
@@ -10,6 +11,16 @@
 #include <unordered_set>
 
 using namespace std;
+
+#ifndef CANDIDATE_WAIT_WEIGHT
+#define CANDIDATE_WAIT_WEIGHT 1.25
+#endif
+#ifndef CANDIDATE_MEMORY_WEIGHT
+#define CANDIDATE_MEMORY_WEIGHT 1.0
+#endif
+#ifndef CANDIDATE_FINISH_WEIGHT
+#define CANDIDATE_FINISH_WEIGHT 1.0
+#endif
 
 bool compareServerById(const ServerSpec &a, const ServerSpec &b) {
     return a.server_id < b.server_id;
@@ -367,30 +378,73 @@ bool GreedyScheduler::isBetterSolution(const Solution &candidate, const Solution
 GreedyScheduler::Solution GreedyScheduler::generateMultiStrategySolution(int num_strategies,
                                                                          Solution *runner_up,
                                                                          Solution *third_place) {
-    Solution best_sol;
-    Solution second_sol;
-    Solution third_sol;
+    struct RankedCandidate {
+        Solution solution;
+        bool valid = false;
+        double balanced_score = 0.0;
+    };
+
+    vector<RankedCandidate> candidates;
+    candidates.reserve(num_strategies);
 
     for (int s = 0; s < num_strategies; ++s) {
         Solution sol = generateGreedySolutionWithStrategy(s);
         if (jobs.size() <= 2000) computeOfficialMetrics(sol);
         else computeMetrics(sol);
 
-        if (isBetterSolution(sol, best_sol)) {
-            third_sol = second_sol;
-            second_sol = best_sol;
-            best_sol = sol;
-        } else if (isBetterSolution(sol, second_sol)) {
-            third_sol = second_sol;
-            second_sol = sol;
-        } else if (third_place && isBetterSolution(sol, third_sol)) {
-            third_sol = sol;
-        }
+        bool valid = sol.records.size() == jobs.size();
+        if (valid && jobs.size() <= 2000) valid = isScheduleValid(sol);
+        candidates.push_back(RankedCandidate{std::move(sol), valid, 0.0});
     }
 
-    if (runner_up) *runner_up = second_sol;
-    if (third_place) *third_place = third_sol;
-    return best_sol;
+    if (candidates.empty()) return Solution{};
+
+    double min_wait = numeric_limits<double>::infinity();
+    double max_wait = -numeric_limits<double>::infinity();
+    double min_memory = numeric_limits<double>::infinity();
+    double max_memory = -numeric_limits<double>::infinity();
+    double min_finish = numeric_limits<double>::infinity();
+    double max_finish = -numeric_limits<double>::infinity();
+
+    for (const auto &candidate : candidates) {
+        if (!candidate.valid) continue;
+        min_wait = min(min_wait, candidate.solution.weighted_waiting);
+        max_wait = max(max_wait, candidate.solution.weighted_waiting);
+        min_memory = min(min_memory, candidate.solution.vram_idle);
+        max_memory = max(max_memory, candidate.solution.vram_idle);
+        min_finish = min(min_finish, candidate.solution.makespan);
+        max_finish = max(max_finish, candidate.solution.makespan);
+    }
+
+    auto normalized = [](double value, double low, double high) {
+        return high > low ? (value - low) / (high - low) : 0.0;
+    };
+    for (auto &candidate : candidates) {
+        if (!candidate.valid) {
+            candidate.balanced_score = numeric_limits<double>::infinity();
+            continue;
+        }
+        candidate.balanced_score =
+            CANDIDATE_WAIT_WEIGHT * normalized(candidate.solution.weighted_waiting, min_wait, max_wait) +
+            CANDIDATE_MEMORY_WEIGHT * normalized(candidate.solution.vram_idle, min_memory, max_memory) +
+            CANDIDATE_FINISH_WEIGHT * normalized(candidate.solution.makespan, min_finish, max_finish);
+    }
+
+    stable_sort(candidates.begin(), candidates.end(), [](const RankedCandidate &a,
+                                                          const RankedCandidate &b) {
+        if (a.valid != b.valid) return a.valid > b.valid;
+        if (a.solution.records.size() != b.solution.records.size()) {
+            return a.solution.records.size() > b.solution.records.size();
+        }
+        if (a.balanced_score != b.balanced_score) {
+            return a.balanced_score < b.balanced_score;
+        }
+        return a.solution.score < b.solution.score;
+    });
+
+    if (runner_up && candidates.size() > 1) *runner_up = candidates[1].solution;
+    if (third_place && candidates.size() > 2) *third_place = candidates[2].solution;
+    return candidates.front().solution;
 }
 
 GreedyScheduler::Solution GreedyScheduler::generateGreedySolutionWithStrategy(int strategy_seed) {
