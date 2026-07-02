@@ -93,6 +93,9 @@ private:
     Solution generateMultiStrategySolution(int num_strategies = 5, Solution *runner_up = nullptr,
                                            Solution *third_place = nullptr);
     Solution generateGreedySolutionWithStrategy(int strategy_seed);
+    Solution generateQueueCandidate(double duration_exp, double age_w, double flex_w,
+                                    double slack_w, double waste_w, double mem_trade_ratio,
+                                    double cost_premium_ratio, bool use_backfill) const;
     Solution refinePlacement(const Solution &initial_solution, int max_passes_override = -1);
     Solution fastRefinePlacement(const Solution &initial_solution);
     Solution placementALNS(const Solution &initial_solution);

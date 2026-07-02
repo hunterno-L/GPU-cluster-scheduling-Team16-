@@ -13,7 +13,7 @@
 using namespace std;
 
 #ifndef CANDIDATE_WAIT_WEIGHT
-#define CANDIDATE_WAIT_WEIGHT 1.25
+#define CANDIDATE_WAIT_WEIGHT 1.5
 #endif
 #ifndef CANDIDATE_MEMORY_WEIGHT
 #define CANDIDATE_MEMORY_WEIGHT 1.0
@@ -385,16 +385,27 @@ GreedyScheduler::Solution GreedyScheduler::generateMultiStrategySolution(int num
     };
 
     vector<RankedCandidate> candidates;
-    candidates.reserve(num_strategies);
+    candidates.reserve(num_strategies + 6);
 
-    for (int s = 0; s < num_strategies; ++s) {
-        Solution sol = generateGreedySolutionWithStrategy(s);
+    auto add_candidate = [&](Solution sol) {
         if (jobs.size() <= 2000) computeOfficialMetrics(sol);
         else computeMetrics(sol);
 
         bool valid = sol.records.size() == jobs.size();
         if (valid && jobs.size() <= 2000) valid = isScheduleValid(sol);
         candidates.push_back(RankedCandidate{std::move(sol), valid, 0.0});
+    };
+
+    for (int s = 0; s < num_strategies; ++s) {
+        add_candidate(generateGreedySolutionWithStrategy(s));
+    }
+
+    if (jobs.size() <= 2000) {
+        add_candidate(generateQueueCandidate(1.0, 0.0, 2.0, 0.60, 0.25, 1e100, 1.0, false));
+        add_candidate(generateQueueCandidate(1.0, 0.0, 2.0, 0.00, 0.25, 1.00, 2.00, true));
+        add_candidate(generateQueueCandidate(1.0, 0.4, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+        add_candidate(generateQueueCandidate(1.0, 0.2, 2.0, 0.20, 0.25, 1.00, 1.50, true));
+        add_candidate(generateQueueCandidate(0.9, 0.3, 2.0, 0.00, 0.25, 1.00, 1.50, true));
     }
 
     if (candidates.empty()) return Solution{};
@@ -707,6 +718,241 @@ GreedyScheduler::Solution GreedyScheduler::generateGreedySolutionWithStrategy(in
         if (it != records.end()) sol.records.push_back(it->second);
     }
 
+    return sol;
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateQueueCandidate(double duration_exp,
+                                                                  double age_w,
+                                                                  double flex_w,
+                                                                  double slack_w,
+                                                                  double waste_w,
+                                                                  double mem_trade_ratio,
+                                                                  double cost_premium_ratio,
+                                                                  bool use_backfill) const {
+    Solution sol;
+    if (jobs.empty()) return sol;
+
+    struct ReadyItem {
+        int job_index = 0;
+        double priority = 0.0;
+        int feasible_count = 0;
+        int duration = 0;
+        int job_id = 0;
+        long long release_time = 0;
+        long long waiting_time = 0;
+    };
+
+    struct ReadyCompare {
+        double age_w = 0.0;
+
+        bool operator()(const ReadyItem &left, const ReadyItem &right) const {
+            double lp = left.priority;
+            double rp = right.priority;
+            if (age_w > 0.0) {
+                lp *= 1.0 + age_w * log(1.0 + max(0LL, left.waiting_time));
+                rp *= 1.0 + age_w * log(1.0 + max(0LL, right.waiting_time));
+            }
+            if (fabs(lp - rp) > 1e-9) return lp < rp;
+            if (left.feasible_count != right.feasible_count) {
+                return left.feasible_count > right.feasible_count;
+            }
+            if (left.duration != right.duration) return left.duration < right.duration;
+            return left.job_id > right.job_id;
+        }
+    };
+
+    vector<MachineState> sim_machines = machines;
+    vector<int> machine_flex(machines.size(), 0);
+    for (const auto &entry : feasible_machines) {
+        unordered_set<int> seen;
+        for (const auto &choice : entry.second) {
+            if (seen.insert(choice.first).second && choice.first >= 0 &&
+                choice.first < static_cast<int>(machine_flex.size())) {
+                ++machine_flex[choice.first];
+            }
+        }
+    }
+
+    auto attempt_limit = [&](int ready_count) {
+        if (ready_count <= 0) return 0;
+        return min(ready_count, min(2048, max(256, static_cast<int>(machines.size()) * 8)));
+    };
+
+    auto try_start = [&](const Job &job, long long current_time,
+                         ScheduleRecord &record, RunningJob &running_job) {
+        auto it = feasible_machines.find(job.job_id);
+        if (it == feasible_machines.end() || it->second.empty()) return false;
+
+        int best_machine = -1;
+        int best_gpu = 0;
+        double best_cost = numeric_limits<double>::infinity();
+        double best_waste = numeric_limits<double>::infinity();
+
+        auto placement_cost = [&](int machine_index, int gpu_used, double &waste_ratio) {
+            const MachineState &machine = sim_machines[machine_index];
+            int total_mem = max(1, gpu_used) * max(1, machine.spec.gpu_memory);
+            waste_ratio = (double)(total_mem - job.gpu_memory) / max(1, total_mem);
+            double flexibility = jobs.empty() ? 0.0 :
+                static_cast<double>(machine_flex[machine_index]) / static_cast<double>(jobs.size());
+            double slack = machine.placementSlack(job, gpu_used);
+            return flex_w * flexibility + slack_w * slack + waste_w * waste_ratio;
+        };
+
+        for (const auto &choice : it->second) {
+            int machine_index = choice.first;
+            int gpu_used = choice.second;
+            if (!sim_machines[machine_index].canStart(job, gpu_used)) continue;
+
+            double waste_ratio = 0.0;
+            double cost = placement_cost(machine_index, gpu_used, waste_ratio);
+            if (cost < best_cost - 1e-12 ||
+                (fabs(cost - best_cost) <= 1e-12 &&
+                 (waste_ratio < best_waste - 1e-12 ||
+                  (fabs(waste_ratio - best_waste) <= 1e-12 &&
+                   (best_machine < 0 ||
+                    sim_machines[machine_index].spec.server_id < sim_machines[best_machine].spec.server_id))))) {
+                best_cost = cost;
+                best_waste = waste_ratio;
+                best_machine = machine_index;
+                best_gpu = gpu_used;
+            }
+        }
+
+        if (best_machine < 0) return false;
+
+        if (mem_trade_ratio < 1e50) {
+            int alt_machine = -1;
+            int alt_gpu = 0;
+            double alt_waste = numeric_limits<double>::infinity();
+            for (const auto &choice : it->second) {
+                int machine_index = choice.first;
+                int gpu_used = choice.second;
+                if (machine_index == best_machine ||
+                    !sim_machines[machine_index].canStart(job, gpu_used)) {
+                    continue;
+                }
+
+                double waste_ratio = 0.0;
+                double cost = placement_cost(machine_index, gpu_used, waste_ratio);
+                if (waste_ratio < best_waste * mem_trade_ratio - 1e-12 &&
+                    cost <= best_cost * cost_premium_ratio + 1e-12 &&
+                    waste_ratio < alt_waste - 1e-12) {
+                    alt_machine = machine_index;
+                    alt_gpu = gpu_used;
+                    alt_waste = waste_ratio;
+                }
+            }
+            if (alt_machine >= 0) {
+                best_machine = alt_machine;
+                best_gpu = alt_gpu;
+            }
+        }
+
+        auto started = sim_machines[best_machine].startJob(job, current_time, best_gpu);
+        record = started.first;
+        running_job = started.second;
+        return true;
+    };
+
+    long long current_time = jobs.front().release_time;
+    int next_job_index = 0;
+    priority_queue<ReadyItem, vector<ReadyItem>, ReadyCompare> pending_jobs(ReadyCompare{age_w});
+    unordered_map<int, ScheduleRecord> records;
+    priority_queue<FinishEvent, vector<FinishEvent>, greater<FinishEvent>> running_heap;
+
+    while (static_cast<int>(records.size()) < static_cast<int>(jobs.size())) {
+        while (!running_heap.empty() && running_heap.top().finish_time <= current_time) {
+            FinishEvent event = running_heap.top();
+            running_heap.pop();
+            auto it = machine_index_by_id.find(event.server_id);
+            if (it != machine_index_by_id.end()) {
+                sim_machines[it->second].releaseJob(event.running_job);
+            }
+        }
+
+        while (next_job_index < static_cast<int>(jobs.size()) &&
+               jobs[next_job_index].release_time <= current_time) {
+            const Job &job = jobs[next_job_index];
+            auto feasible_it = feasible_machines.find(job.job_id);
+            int feasible_count = feasible_it != feasible_machines.end()
+                ? static_cast<int>(feasible_it->second.size()) : 0;
+            double priority = 1000000.0 * static_cast<double>(job.weight) /
+                              pow(static_cast<double>(max(1, job.duration)), duration_exp);
+            pending_jobs.push(ReadyItem{next_job_index, priority, feasible_count, job.duration,
+                                        job.job_id, job.release_time, 0});
+            ++next_job_index;
+        }
+
+        const int limit = attempt_limit(static_cast<int>(pending_jobs.size()));
+        vector<ReadyItem> deferred;
+        deferred.reserve(limit);
+        bool scheduled_one = false;
+
+        for (int attempt = 0; attempt < limit && !pending_jobs.empty(); ++attempt) {
+            ReadyItem ready = pending_jobs.top();
+            pending_jobs.pop();
+            const Job &job = jobs[ready.job_index];
+            if (records.count(job.job_id)) continue;
+
+            ScheduleRecord record;
+            RunningJob running_job;
+            if (try_start(job, current_time, record, running_job)) {
+                records[job.job_id] = record;
+                running_heap.push(FinishEvent{running_job.finish_time, running_job.server_id,
+                                              running_job.job_id, running_job});
+                scheduled_one = true;
+            } else {
+                deferred.push_back(ready);
+            }
+        }
+
+        if (use_backfill && !deferred.empty()) {
+            vector<ReadyItem> still_deferred;
+            still_deferred.reserve(deferred.size());
+            for (const ReadyItem &ready : deferred) {
+                const Job &job = jobs[ready.job_index];
+                if (records.count(job.job_id)) continue;
+
+                ScheduleRecord record;
+                RunningJob running_job;
+                if (try_start(job, current_time, record, running_job)) {
+                    records[job.job_id] = record;
+                    running_heap.push(FinishEvent{running_job.finish_time, running_job.server_id,
+                                                  running_job.job_id, running_job});
+                    scheduled_one = true;
+                } else {
+                    still_deferred.push_back(ready);
+                }
+            }
+            deferred = std::move(still_deferred);
+        }
+
+        for (ReadyItem ready : deferred) {
+            ready.waiting_time = current_time - ready.release_time;
+            pending_jobs.push(ready);
+        }
+
+        if (static_cast<int>(records.size()) == static_cast<int>(jobs.size())) break;
+        if (scheduled_one) continue;
+
+        long long next_time = -1;
+        if (next_job_index < static_cast<int>(jobs.size()) &&
+            jobs[next_job_index].release_time > current_time) {
+            next_time = jobs[next_job_index].release_time;
+        }
+        if (!running_heap.empty() && running_heap.top().finish_time > current_time &&
+            (next_time == -1 || running_heap.top().finish_time < next_time)) {
+            next_time = running_heap.top().finish_time;
+        }
+        if (next_time == -1) break;
+        current_time = next_time;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= static_cast<int>(jobs.size()); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
     return sol;
 }
 
