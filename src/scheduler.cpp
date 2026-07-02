@@ -400,12 +400,24 @@ GreedyScheduler::Solution GreedyScheduler::generateMultiStrategySolution(int num
         add_candidate(generateGreedySolutionWithStrategy(s));
     }
 
-    if (jobs.size() <= 2000) {
+    if (jobs.size() <= 2000 || profile.vram_pressure < 40.0) {
         add_candidate(generateQueueCandidate(1.0, 0.0, 2.0, 0.60, 0.25, 1e100, 1.0, false));
-        add_candidate(generateQueueCandidate(1.0, 0.0, 2.0, 0.00, 0.25, 1.00, 2.00, true));
-        add_candidate(generateQueueCandidate(1.0, 0.4, 2.0, 0.00, 0.25, 1.00, 1.50, true));
-        add_candidate(generateQueueCandidate(1.0, 0.2, 2.0, 0.20, 0.25, 1.00, 1.50, true));
-        add_candidate(generateQueueCandidate(0.9, 0.3, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+        if (jobs.size() <= 2000) {
+            add_candidate(generateQueueCandidate(1.0, 0.0, 2.0, 0.00, 0.25, 1.00, 2.00, true));
+            add_candidate(generateQueueCandidate(1.0, 0.4, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+            add_candidate(generateQueueCandidate(1.0, 0.2, 2.0, 0.20, 0.25, 1.00, 1.50, true));
+            add_candidate(generateQueueCandidate(0.9, 0.3, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+        } else {
+            const bool allow_large_extra = jobs.size() < 4700;
+            if (allow_large_extra) {
+                add_candidate(generateQueueCandidate(1.0, 0.4, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+            }
+            if (allow_large_extra && (jobs.size() < 3000 || profile.long_job_ratio < 0.30)) {
+                add_candidate(generateQueueCandidate(1.0, 0.0, 2.0, 0.00, 0.25, 1.00, 2.00, true));
+                add_candidate(generateQueueCandidate(1.0, 0.2, 2.0, 0.20, 0.25, 1.00, 1.50, true));
+                add_candidate(generateQueueCandidate(0.9, 0.3, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+            }
+        }
     }
 
     if (candidates.empty()) return Solution{};
