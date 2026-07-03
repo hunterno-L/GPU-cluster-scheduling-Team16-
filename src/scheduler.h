@@ -9,6 +9,7 @@
 
 #include "machine_state.h"
 #include "models.h"
+#include <unordered_set>
 
 struct FinishEvent {
     long long finish_time;
@@ -153,12 +154,29 @@ private:
     Solution polishAssignmentReplayLight(const Solution &best);
     bool shouldUseAssignmentReplayLight() const;
     bool shouldUseLongJobDedicatedPath() const;
+    bool shouldUseAssignmentFirstMainPath() const;
+    bool shouldUseSingleServerDedicatedPath() const;
+    bool shouldUseMemBoundDedicatedPath() const;
+    bool shouldUseMemBoundMainPath() const;
+    bool shouldUseMegascaleDedicatedPath() const;
     Solution generateLongJobDedicatedSolution();
+    Solution generateSingleServerDedicatedSolution();
+    Solution generateMemBoundDedicatedSolution();
+    Solution generateMegascaleDedicatedSolution();
     Solution generateCriticalRatioSolution(int strategy_seed);
     Solution generatePlacementFirstSolution(int strategy_seed);
     Solution generateListSchedulingSolution(int strategy_seed);
+    Solution generateListSchedulingSolutionFast(int strategy_seed);
+    Solution generateMegascaleCriticalRatioList(int strategy_seed);
+    Solution generateMegascaleBalancedAssignment(int strategy_seed, int max_replays = 1);
     Solution polishListSchedulingPipeline(const Solution &list_source, int max_replays = 1);
     void polishLargeInstanceReplay(Solution &best);
+    void polishMegascaleInstanceReplay(Solution &best);
+    Solution lightweightLNS(const Solution &initial, int max_iters = 60);
+    Solution rebuildWithFlexibleJobs(const Solution &base,
+                                     const std::unordered_set<int> &flexible_jobs) const;
+    Solution jointLNS(const Solution &initial, int max_iters = 40);
+    Solution megascaleJointLNS(const Solution &initial, int max_iters = 5);
     double criticalRatioPriority(const Job &job,
                                  const std::vector<MachineState> &sim_machines,
                                  long long current_time) const;

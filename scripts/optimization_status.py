@@ -114,12 +114,13 @@ STATUS = r"""
 
   下一步 P2（可选）: Assignment-first 调度 / 单机 shelf 算法 / est_start deferred 优先级
 
-  exp19 新增（List 流水线 + 扩展 Replay 门控）:
-    - polishListSchedulingPipeline: list 解 + assignment replay
-    - dedicated 421-1200 全面 list 流水线；list 内 deferred est_start 排序
-    - polishLargeInstanceReplay 扩展至 jobs 901-2000（≤1500 双序 replay）
-    - 编译: build/execname_exp19.exe
-    - 快测: 官方 111,803,274 (100/100) | 合成 64,321,399 (1000/1000)
+  exp24 新增（Megascale 负载均衡 + 分级流水线）:
+    - generateMegascaleBalancedAssignment: 强化 wait/load/est_start 的静态分配
+    - generateMegascaleCriticalRatioList: 动态 CR top-K 列表调度（基础设施）
+    - 分级 dedicated: 2001-2800 全量 / 2801-3200 轻量 / >3200 双 static + 单 greedy
+    - 编译: build/execname_exp24.exe / build/execname_new.exe
+    - 快测: 官方 111,679,114 (100/100, max_rt 13.9s) | long_jobs 569,920,849
+    - case081 ww 159,404,049 (exp23: 163,949,460)
 
 六、历史基线参考（优化演进）
 ----------------------------
