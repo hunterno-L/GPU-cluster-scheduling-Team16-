@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+GPU-Team16 调度优化 — 思路与进度说明脚本
+
+用法:
+  python scripts/optimization_status.py          # 打印到终端
+  python scripts/optimization_status.py --save   # 另存 results/optimization_status.txt
+
+关机/换机后先:
+  1. 阅读本脚本输出
+  2. 编译: g++ -std=c++17 -O2 src/main.cpp src/parser.cpp src/machine_state.cpp src/scheduler.cpp src/output.cpp -o build/execname_new.exe
+  3. 全量评测: python scripts/evaluate_buckets.py --exe build/execname_new.exe --timeout 10
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+STATUS = r"""
+================================================================================
+ GPU-Team16 调度优化 — 思路与当前进度
+ 生成时间: {timestamp}
+ 工作目录: {root}
+================================================================================
+
+一、总体目标
+------------
+- 主指标: weighted_waiting（加权等待）尽量低
+- 约束: 100% 合法解；max_rt 可控（官方 ~2s，合成 ~3s 内）
+- 方法论: InstanceProfile 画像驱动，不过拟合 case 编号；合成集分桶调参 + 官方 081-100 锁定回归
+
+二、当前架构（稳定基线）
+------------------------
+流水线:
+  computeInstanceProfile()
+    → generateMultiStrategySolution()   # 多策略贪心
+    → 分级精修 (refine / fastRefine / lightAssignment / ALNS)
+    → 合法解输出（不用 verifyAndFix）
+
+分工:
+  成员 A: PendingJobComparator + resolveOrderVariant + jobOrderPriority
+  成员 B: chooseBestPlacement + placementScore/Cost + 画像触发 refine
+
+三、已验证有效的优化（保留在代码中）
+------------------------------------
+【画像与排序】
+  - resolveOrderVariant: long_job / burst / vram / resource / high_gpu / single 变体表
+  - placementTieBreakPrefer: 受限任务优先、CPU/内存/min_gpu 画像 tie-break
+  - jobOrderPriority: 等待老化、长任务加权、单机高权重额外 boost
+
+【Pending 采样】
+  - shouldDrainFullPending: 小/单机/长任务/burst/资源紧张时全量评估
+  - 中等规模 nth_element + 紧迫度 top-K；大规模堆顶采样
+  - adaptivePendingCap 画像加成
+
+【放置与精修】
+  - placementScore/Cost: 负载均衡、长任务堵机惩罚、CPU/内存余量、VRAM 紧排
+  - shouldLongJobRefine / shouldFastRefine / shouldSingleServerRefine 分级精修
+  - lightLongJobAssignmentRefine: 高影响任务迁机/GPU 重分配（预算 30-36）
+  - 多策略早停: 超大实例 / 长任务中等规模 stale 早停
+
+【效率】
+  - jobs>2500 连续无改进早停；long_job 精修 top_k / runner_up 预算门控
+  - partial_sort 改 nth_element；已排序 pending 跳过重复 sort
+
+四、本轮新增（est_start + 单机专用）— 已实现，待完整回归
+----------------------------------------------------------
+【1. est_start 放置比较】文件: machine_state.cpp/h, scheduler.cpp
+
+  新增 MachineState::earliestFeasibleStart(job, gpu, current_time)
+    - 若当前资源可开工 → max(current_time, release_time)
+    - 否则按 running_jobs 的 finish_time 事件释放资源，找最早可行时刻
+
+  新增 MachineState::totalRemainingGpuWork(current_time)
+    - 机器剩余 GPU·时间 工作量，用于拥堵惩罚
+
+  新增 GreedyScheduler::estStartPlacementAdjust(...)
+    - 综合: weight×延迟、机器拥堵、burst/long_job/单机 画像系数
+    - 在 chooseBestPlacement::consider() 中计入 cost/score
+    - 同分 tie-break: est_start 更早优先
+
+  主循环安全: startJob 前增加 canStart 检查
+
+【2. 单机专用贪心路径】文件: scheduler.cpp/h
+
+  新增 generateDedicatedSingleServerSolution(strategy_seed)
+    - 固定 cost 放置模式 (placement_mode 1 或 3)
+    - generation_single_tight_gpu_: 只枚举 min_gpu（紧排显存）
+    - 单机 pending 全量评估扩至 400 job
+
+  generateMultiStrategySolution:
+    - 单机时额外跑 3 条 dedicated 策略（不替换原有策略，是追加候选）
+
+五、最新全量评测（exp12 + P1 修正，build/execname_new.exe）
+----------------------------------------------------------
+  P0 已完成；P1 修正: 单机 pending 恢复 220 上限；est_start 跳过单机；dedicated 2 条
+
+  | 数据集          | exp11 基线    | 当前          | 变化        |
+  |-----------------|---------------|---------------|-------------|
+  | 官方 100        | 111,586,279   | 111,550,907   | ↓ 0.032%    |
+  | 锁定 081-100    | 544,534,619   | 544,461,654   | ↓ 0.013%    |
+  | 合成 1000       | 64,777,268    | ~64,778,826*  | ≈持平       |
+  | long_jobs       | 584,173,642   | 584,173,642   | 持平        |
+  | single_server   | 199,604,465   | 199,604,465   | 持平(P1后)  |
+  | burst_t0        | 73,159,803    | 73,170,403    | 略回退      |
+  | mem_bound       | 165,447,277   | 165,447,277   | 持平        |
+
+  *合成全集 P1 前全量; single_server 修正后合成均值可能略降，可重跑 confirm
+  合法率: 1100/1100 | max_rt: 官方 ~1.6s, 合成 ~2.7s
+
+  下一步 P2（可选）: Assignment-first 调度 / 单机 shelf 算法 / est_start deferred 优先级
+
+  exp19 新增（List 流水线 + 扩展 Replay 门控）:
+    - polishListSchedulingPipeline: list 解 + assignment replay
+    - dedicated 421-1200 全面 list 流水线；list 内 deferred est_start 排序
+    - polishLargeInstanceReplay 扩展至 jobs 901-2000（≤1500 双序 replay）
+    - 编译: build/execname_exp19.exe
+    - 快测: 官方 111,803,274 (100/100) | 合成 64,321,399 (1000/1000)
+
+六、历史基线参考（优化演进）
+----------------------------
+  | 阶段              | 官方 avg ww   | 合成 avg ww  | long_jobs ww   |
+  |-------------------|---------------|--------------|----------------|
+  | 早期稳定          | ~111,611,826  | ~64,984,444  | ~585,625,527   |
+  | exp11（上轮）     | 111,586,279   | 64,777,268   | 584,173,642    |
+  | exp12（本轮快测） | 111,550,907   | （未全量）   | 584,173,642    |
+
+七、已验证无效 / 已回退路线（勿重复）
+------------------------------------
+  - 策略 bandit / 按 case 编号硬编码
+  - replayScheduleForRefine 改用 replayForRefine（fastRefine 内 5x 减速，勿重复）
+  - 官方指标驱动多策略在线选优
+  - lightLongJobAssignmentRefine 对 long_job 用 resource 机器排序（伤害 long_jobs）
+  - long_job assignment 门槛从 0.45 降到 0.42（曾导致 long_jobs 回退，已恢复 0.45）
+
+八、结构性瓶颈（为何微调收益递减）
+----------------------------------
+  1. replaySchedule 内部固定 WSPT，精修改 assignment 不改主序 → 顺序类精修效果有限
+  2. 贪心在 current_time 放置，此前未显式比较「最早可开工时刻」（est_start 已部分缓解）
+  3. 弱桶是场景结构问题: long_jobs / single_server / mem_bound 需专用流水线
+
+九、下一步建议（开机后优先级）
+------------------------------
+  P0 — 已完成:
+    [x] 编译 execname_new.exe
+    [x] evaluate_buckets 全量
+    [x] eval_synthetic_tags 分桶
+    [x] P1: 单机 pending 220 + est_start 跳过单机
+
+  P1 — 可选微调:
+    [ ] burst_t0 微回退 (~0.01%): 可略降 burst 的 est_start coef (+0.05→+0.03)
+    [ ] 重跑合成全集确认 single_server 修正后均值
+
+  P2 — 中期结构优化（未做）:
+    [ ] Assignment-first 调度器（精修不再依赖 WSPT replay）
+    [ ] 单机 shelf/bin-packing 独立模块
+    [ ] est_start 扩展到「当前不可开工但可预约最早机器」的 deferred 优先级
+
+十、关键文件清单
+----------------
+  src/scheduler.cpp      — 主调度逻辑 (~2200 行)
+  src/scheduler.h
+  src/machine_state.cpp  — earliestFeasibleStart, totalRemainingGpuWork
+  src/machine_state.h
+  scripts/evaluate_buckets.py      — 调参/锁定/官方/合成全集
+  scripts/eval_synthetic_tags.py     — 合成按场景标签
+  scripts/evaluate_metrics.py        — 单 pattern 评测
+  scripts/optimization_status.py     — 本脚本
+
+十一、编译与评测命令
+--------------------
+  cd GPU-Team16
+  g++ -std=c++17 -O2 src/main.cpp src/parser.cpp src/machine_state.cpp src/scheduler.cpp src/output.cpp -o build/execname_new.exe
+
+  python scripts/test_parallel_start.py build/execname_new.exe
+
+  python scripts/evaluate_buckets.py ^
+    --exe build/execname_new.exe ^
+    --official "d:\课程设计相关材料\02-数据集" ^
+    --synthetic "d:\课程设计相关材料\02-数据集\synthetic" ^
+    --timeout 10
+
+================================================================================
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="打印 GPU 调度优化思路与进度")
+    parser.add_argument("--save", action="store_true", help="保存到 results/optimization_status.txt")
+    args = parser.parse_args()
+
+    text = STATUS.format(
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        root=str(ROOT),
+    )
+    print(text)
+
+    if args.save:
+        out = ROOT / "results" / "optimization_status.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(f"[saved] {out}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

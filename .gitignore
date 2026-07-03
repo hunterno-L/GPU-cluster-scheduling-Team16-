@@ -1,4 +1,7 @@
 build/
+build_cmake/
+__pycache__/
+*.pyc
 *.o
 *.exe
 *.out

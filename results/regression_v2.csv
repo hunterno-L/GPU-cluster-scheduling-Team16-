@@ -1,0 +1,4 @@
+split,valid,cur_ww,cur_vram,cur_mk,max_rt
+tune,0/80,0.0,0.0,0.0,5.0
+locked,0/20,0.0,0.0,0.0,5.0
+official_all,0/100,0.0,0.0,0.0,5.0

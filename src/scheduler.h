@@ -150,6 +150,21 @@ private:
     bool shouldDualReplayInRefine() const;
     bool shouldAssignmentReplayPolish() const;
     Solution polishAssignmentReplay(const Solution &best);
+    Solution polishAssignmentReplayLight(const Solution &best);
+    bool shouldUseAssignmentReplayLight() const;
+    bool shouldUseLongJobDedicatedPath() const;
+    Solution generateLongJobDedicatedSolution();
+    Solution generateCriticalRatioSolution(int strategy_seed);
+    Solution generatePlacementFirstSolution(int strategy_seed);
+    Solution generateListSchedulingSolution(int strategy_seed);
+    Solution polishListSchedulingPipeline(const Solution &list_source, int max_replays = 1);
+    void polishLargeInstanceReplay(Solution &best);
+    double criticalRatioPriority(const Job &job,
+                                 const std::vector<MachineState> &sim_machines,
+                                 long long current_time) const;
+    Solution pickBetterSolution(const Solution &a, const Solution &b) const;
+    Solution generateStaticAssignmentSolution(int strategy_seed, int max_replays = -1);
+    Solution runAssignmentFirstPipeline(const Solution &assignment_source, int max_replays = -1);
     long long minEarliestStartForJob(const Job &job,
                                      const std::vector<MachineState> &sim_machines,
                                      long long current_time) const;
@@ -181,6 +196,8 @@ private:
     mutable int generation_placement_override_ = -1;
     mutable bool generation_single_tight_gpu_ = false;
     mutable int generation_single_shelf_variant_ = -1;
+    mutable bool generation_critical_ratio_ = false;
+    mutable bool generation_placement_first_ = false;
     void updateGlobalLoadCache(long long current_time,
                                const std::vector<MachineState> &sim_machines) const;
 };
