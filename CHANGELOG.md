@@ -1,55 +1,76 @@
-# lab3.0 CHANGELOG
+# lab4.0 CHANGELOG
 
-## 相比 lab2.0 的改动
+## 相比 lab3.0 的核心改进
 
-### 1. 新增 Part-A 调度顺序参数（`#define` 可配置，默认关闭）
+### 1. 架构升级：从单策略到多策略 meta-scheduler
 
-| 参数 | 默认值 | 作用 |
-|---|:---:|---|
-| `AGE_W` | 0.0 | 等待时间老化权重。job 等待越久优先级提升越多，使用 log 衰减防止饥饿 |
-| `DURATION_EXP` | 1.0 | WSPT 中 duration 的指数。>1 更强偏好短任务，=1 即标准 WSPT |
-| `HIGH_PRIORITY_BOOST` | 0.0 | 最高权重 job 的额外保护力度 |
+**lab3.0**：程序用一组固定参数生成单次调度并输出。
 
-实现位置：`ReadyJobCompare::operator()` 中计算 effective priority。
+**lab4.0**：程序先用 **12 组不同参数组合** 生成多个候选调度解，然后对每个实例在候选池内做 **内部 min-max 归一化评分**，选择最优输出。
 
-### 2. 新增 Part-B 选机策略：mem-trade-off（`#define` 可配置，默认开启）
+```
+lab3.0:  输入 ──► [单次调度(固定参数)] ──► 输出
 
-| 参数 | 默认值 | 作用 |
-|---|:---:|---|
-| `MEM_TRADE_OFF_RATIO` | 1.00 | 替换当前最优机器的阈值：候选机器的显存浪费 < 最优机器的浪费 × ratio |
-| `COST_PREMIUM_RATIO` | 2.00 | 允许替换的最高 cost 溢价倍率：候选机器的 cost ≤ 最优机器的 cost × ratio |
+lab4.0:  输入 ──► [调度1(参数A)]
+                  [调度2(参数B)]
+                  ...
+                  [调度12(参数L)] ──► 候选池归一化评分 ──► 最优输出
+```
 
-实现位置：`tryOne()` 中二阶段选机逻辑。第一阶段按 cost 选最优机器，第二阶段在 cost 容忍范围内寻找更低显存浪费的替代机器。
+### 2. 参数系统从编译期改为运行时
 
-### 3. 修复 waiting_time 更新 bug
+| lab3.0 | lab4.0 |
+|--------|--------|
+| `#define AGE_W 0.4` 等编译期宏 | `SchedulerParams` 运行时结构体 |
+| 每改一个参数需重新编译 | 同一份二进制支持任意参数 |
+| ReadyJobCompare 无状态 | ReadyJobCompare 持 params 指针 |
 
-lab2.0 无 aging 功能。Fusion 原始版本中 aging 的 `waiting_time` 除以 100 且 backfill 回推时不更新。lab3.0 已修复：
-- `waiting_time = current_time - release_time`（精确值，不除 100）
-- 每次 job 回推到 pending 队列时重新计算 waiting_time
+### 3. 候选解选择评分
 
-### 4. `schedule()` 中的 priority 计算
+```c
+score = 1.25 × norm(E_wait) + 1.0 × norm(E_memory) + 1.0 × norm(E_finish)
+```
 
-从 `weight / duration` 改为 `weight / pow(duration, DURATION_EXP)`，默认值 1.0 时与 lab2.0 行为完全一致。
+三项指标在候选池内部各自做 min-max 归一化，使正式评分逻辑接近官方逐实例归一化方式。权重 1.25/1.0/1.0 在分析报告3中经验证优于等权。
+
+### 4. 12 组策略参数覆盖
+
+| 策略数 | 覆盖维 |
+|--------|--------|
+| 1 组 | lab3.0 最优参数 (AG=0.4, CP=1.5) |
+| 3 组 | 不同 aging 强度 (0 / 0.2 / 0.3) |
+| 3 组 | 不同 cost premium 激进程度 (1.1 / 2.0 / 3.0) |
+| 2 组 | 不同 MEM ratio (0.7 / 1.5) |
+| 1 组 | 纯 WSPT 基线（无 aging、无 mem-trade-off） |
+| 2 组 | 短任务偏好 (DURATION_EXP=1.1) |
 
 ---
 
-## 参数调优结果（100 例，修正后的评分公式）
+## 评测结果（100 例，修正后评分公式）
 
-| 版本 | Proxy | E_wait | E_memory | E_finish |
-|---|:---:|---|---|---|
-| lab2.0 (基线) | 136.89 | 10,990M | 3,527 | 2,259K |
-| A1b (AGE=0.3) | 126.45 | 10,987M | 3,530 | 2,258K |
-| Fusion-v2 原版 | 93.29 | 10,991M | 2,875 | 2,263K |
-| **lab3.0 最优 (AGE=0.4, CP=1.5)** | **85.16** | 10,987M | 3,003 | 2,257K |
+| 版本 | Proxy | E_wait | E_memory | E_finish | 耗时 |
+|---|:---:|---|---|---|---|
+| **lab4.0** | **29.02** | **10,976M** | **2,823** | **2,250K** | 198s |
+| lab3.0 | 93.94 | 10,987M | 3,003 | 2,257K | 23s |
+| Fusion-v2 | 107.86 | 10,991M | 2,875 | 2,263K | 25s |
+| lab2.0 | 150.03 | 10,990M | 3,527 | 2,259K | 14s |
 
-### 默认参数行为
+- Proxy 相比 lab3.0 提升 **65 分** (93→29)，相比 lab2.0 提升 **121 分** (150→29)
+- 三项原始指标**全部最优**
+- 100/100 合法，单例最大耗时 ~10s，远低于 60s 限制
 
-所有新参数默认值保证与 lab2.0 行为一致：
-- `AGE_W=0.0` → aging 短路跳过
-- `DURATION_EXP=1.0` → priority 同 lab2.0
-- `HIGH_PRIORITY_BOOST=0.0` → 无额外加成
-- `MEM_TRADE_OFF_RATIO=1.00, COST_PREMIUM_RATIO=2.00` → mem-trade-off 生效
+---
 
-### 兼容性
+## 修改的文件
 
-修改仅涉及 `scheduler.h` 和 `scheduler.cpp`，`machine_state.*`、`parser.*`、`output.*`、`models.h`、`main.cpp` 与 lab2.0 完全相同。
+| 文件 | 变更 |
+|------|------|
+| `src/scheduler.h` | 新增 `SchedulerParams` 结构体；`ReadyJobCompare` 持 params 指针；`SchedulerEngine` 构造函数新增 params 参数 |
+| `src/scheduler.cpp` | 参数引用改为 `params.xxx`；`schedule()` 中 priority_queue、比较器、priority 计算均使用运行时参数 |
+| `src/main.cpp` | 完全重写：12 策略候选池、调度执行、内部归一化评分、最优解选择 |
+| `src/models.h` | 不变 |
+| `src/machine_state.*` | 不变 |
+| `src/parser.*` | 不变 |
+| `src/output.*` | 不变 |
+| `run.sh` | 不变 |
+| `build.sh` | 不变 |

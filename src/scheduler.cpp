@@ -11,21 +11,14 @@ bool FinishEvent::operator>(const FinishEvent &o) const {
     if(server_id!=o.server_id)return server_id>o.server_id; return job_id>o.job_id;
 }
 bool ReadyJobCompare::operator()(const ReadyJob &l, const ReadyJob &r) const {
-    // Compute effective priority with aging and high-priority boost
-    double lp = l.priority;
-    double rp = r.priority;
-    if (AGE_W > 0.0) {
-        // Wait-time aging: jobs that wait longer get priority boost
-        // Use log to get diminishing returns (prevents starving new arrivals indefinitely)
-        lp *= (1.0 + AGE_W * log(1.0 + max(0LL, l.waiting_time)));
-        rp *= (1.0 + AGE_W * log(1.0 + max(0LL, r.waiting_time)));
-        // Note: waiting_time is updated before re-push in schedule()
+    double lp = l.priority, rp = r.priority;
+    if (params && params->age_w > 0.0) {
+        lp *= (1.0 + params->age_w * log(1.0 + max(0LL, l.waiting_time)));
+        rp *= (1.0 + params->age_w * log(1.0 + max(0LL, r.waiting_time)));
     }
-    if (HIGH_PRIORITY_BOOST > 0.0) {
-        // Extra boost for the absolute highest-weight jobs
-        // This uses the original priority (which embeds weight) as a proxy
-        lp *= (1.0 + HIGH_PRIORITY_BOOST * l.priority / 1000000.0);
-        rp *= (1.0 + HIGH_PRIORITY_BOOST * r.priority / 1000000.0);
+    if (params && params->high_priority_boost > 0.0) {
+        lp *= (1.0 + params->high_priority_boost * l.priority / 1000000.0);
+        rp *= (1.0 + params->high_priority_boost * r.priority / 1000000.0);
     }
     if (fabs(lp - rp) > 1e-9) return lp < rp;
     if (l.feasible_count != r.feasible_count) return l.feasible_count > r.feasible_count;
@@ -33,7 +26,9 @@ bool ReadyJobCompare::operator()(const ReadyJob &l, const ReadyJob &r) const {
     return l.job_id > r.job_id;
 }
 
-SchedulerEngine::SchedulerEngine(const vector<ServerSpec> &sv, const vector<Job> &jb, bool(*c)(const Job&,const Job&), const string&, bool _bf):bf(_bf){
+SchedulerEngine::SchedulerEngine(const vector<ServerSpec> &sv, const vector<Job> &jb,
+    const SchedulerParams& p, bool(*c)(const Job&,const Job&), const string&, bool _bf)
+    : params(p), bf(_bf) {
     vector<ServerSpec> s=sv; sort(s.begin(),s.end(),[](auto&a,auto&b){return a.server_id<b.server_id;});
     for(auto&x:s)ms.emplace_back(x); for(int i=0;i<(int)ms.size();++i)mi[ms[i].spec.server_id]=i;
     if(c){jobs=jb;sort(jobs.begin(),jobs.end(),c);}else{jobs=jb;sort(jobs.begin(),jobs.end(),cR);}
@@ -45,11 +40,9 @@ void SchedulerEngine::buildFeasible(){ mf.assign(ms.size(),0);
         for(int i=0;i<(int)ms.size();++i){ int g=ms[i].requiredGpuCount(j);
             if(ms[i].canEverRun(j,g)){e.push_back({i,g});++mf[i];} }
         if(!e.empty())fe[j.job_id]=e; }
-    // Precompute flexibility ratios
     mfi.resize(ms.size()); for(int i=0;i<(int)ms.size();++i)mfi[i]=(double)mf[i]*flex_inv;
 }
 
-// Fully inlined cost (hot path, ~80% of runtime)
 inline double SchedulerEngine::cost(int mi, const Job &j, int g) const {
     const auto &m=ms[mi];
     double gs=((double)m.remainingGpu()-g)*m.inv_gpu_count;
@@ -65,9 +58,6 @@ inline double SchedulerEngine::cost(int mi, const Job &j, int g) const {
     return c;
 }
 
-// Placement: pick best-cost machine first, but prefer memory-efficient alternative
-// when the premium in cost is small (MEM_TRADE_OFF_RATIO / COST_PREMIUM_RATIO in scheduler.h)
-
 SchedulerEngine::SR SchedulerEngine::tryOne(const Job &job, long long t){
     auto it=fe.find(job.job_id); if(it==fe.end())return SR{};
     auto&es=it->second; int bi=-1,bg=-1; double bc=1e18, bwaste=1e18;
@@ -80,15 +70,14 @@ SchedulerEngine::SR SchedulerEngine::tryOne(const Job &job, long long t){
     }
     if(bi<0)return SR{};
 
-    // Second pass: try to find a memory-waste-friendly alternative at limited cost premium
-    if(MEM_TRADE_OFF_RATIO < 1e100){
+    if(params.mem_trade_off_ratio > 1e-9){
         int ai=-1, ag=-1; double awaste=1e18;
         for(auto&e:es){ int i=e.first,g=e.second; if(!ms[i].canStart(job,g)||i==bi)continue;
             int cards=max(g,1); int tm=cards*ms[i].spec.gpu_memory;
             double w=(tm>0)?(double)(tm-job.gpu_memory)/tm:0;
-            if(w < bwaste * MEM_TRADE_OFF_RATIO){
+            if(w < bwaste * params.mem_trade_off_ratio){
                 double c=cost(i,job,g);
-                if(c <= bc * COST_PREMIUM_RATIO && w < awaste){ ai=i; ag=g; awaste=w; }
+                if(c <= bc * params.cost_premium_ratio && w < awaste){ ai=i; ag=g; awaste=w; }
             }
         }
         if(ai>=0){ bi=ai; bg=ag; }
@@ -101,7 +90,7 @@ int SchedulerEngine::dlimit(int rc)const{if(rc==0)return 0; return min(rc,min(20
 unordered_map<int,ScheduleRecord> SchedulerEngine::schedule(){
     if(jobs.empty())return{};
     unordered_map<int,ScheduleRecord> rec; unordered_set<int> sk;
-    FH run; RH pq;
+    FH run; RH pq((ReadyJobCompare(&params)));
     vector<Job> av=jobs; sort(av.begin(),av.end(),cR);
     int ai=0; long long t=jobs[0].release_time;
     const int JN=(int)jobs.size(), MN=(int)ms.size();
@@ -111,7 +100,7 @@ unordered_map<int,ScheduleRecord> SchedulerEngine::schedule(){
         while(ai<(int)av.size()&&av[ai].release_time<=t){
             int ji=ai; auto&j=av[ai++]; if(rec.count(j.job_id)||sk.count(j.job_id))continue;
             auto ft=fe.find(j.job_id); int fc=(ft!=fe.end())?(int)ft->second.size():0;
-            double pri = 1000000.0 * j.weight / pow(max(j.duration, 1), DURATION_EXP);
+            double pri = 1000000.0 * j.weight / pow(max(j.duration, 1), params.duration_exp);
             pq.push(ReadyJob{ji, pri, fc, j.duration, j.job_id, j.release_time, 0LL});
         }
         int lim=dlimit((int)pq.size()); vector<ReadyJob> df;df.reserve(lim);
@@ -124,7 +113,7 @@ unordered_map<int,ScheduleRecord> SchedulerEngine::schedule(){
         }
         if(bf&&!df.empty()){
 #if BACKFILL_ITER
-            bool changed=true; int guard=0; // iterative backfill
+            bool changed=true; int guard=0;
             while(changed&&guard++<100){
                 changed=false; vector<ReadyJob> nd; nd.reserve(df.size());
                 for(auto&rj:df){ auto&j=jobs[rj.job_index];
@@ -136,7 +125,7 @@ unordered_map<int,ScheduleRecord> SchedulerEngine::schedule(){
                 } df=move(nd);
             }
 #else
-            { vector<ReadyJob> nd; nd.reserve(df.size());  // single-pass backfill
+            { vector<ReadyJob> nd; nd.reserve(df.size());
                 for(auto&rj:df){ auto&j=jobs[rj.job_index];
                     if(rec.count(j.job_id)||sk.count(j.job_id))continue;
                     auto r=tryOne(j,t); if(r.ok){
@@ -150,8 +139,7 @@ unordered_map<int,ScheduleRecord> SchedulerEngine::schedule(){
         }else{ for(auto&rj:df){
             auto&j=jobs[rj.job_index]; if(fe.find(j.job_id)==fe.end())sk.insert(j.job_id); else { rj.waiting_time = t - rj.release_time; pq.push(rj); } }}
         if((int)(rec.size()+sk.size())>=JN)break;
-        { // nextTime inlined (avoids vector alloc each call)
-            long long nt_val=-1; long long rn=ai<JN?jobs[ai].release_time:-1;
+        { long long nt_val=-1; long long rn=ai<JN?jobs[ai].release_time:-1;
             if(rn>t&&(nt_val==-1||rn<nt_val))nt_val=rn;
             if(!run.empty()){ long long ft=run.top().finish_time; if(ft>t&&(nt_val==-1||ft<nt_val))nt_val=ft; }
             if(nt_val==-1){if(!run.empty())nt_val=run.top().finish_time; else throw runtime_error("deadlock");}
@@ -164,4 +152,6 @@ void SchedulerEngine::rel(long long tt,FH&h){ while(!h.empty()&&h.top().finish_t
 int SchedulerEngine::totalWeight(const unordered_map<int,ScheduleRecord>&rc,const vector<Job>&jb){
     unordered_map<int,int>w;for(auto&j:jb)w[j.job_id]=j.weight; int T=0;for(auto&kv:rc){auto it=w.find(kv.first);if(it!=w.end())T+=it->second;}return T;
 }
-SchedulerEngine makeOptimized(const vector<ServerSpec>&sv,const vector<Job>&jb){ return SchedulerEngine(sv,jb,nullptr,"best-fit",true); }
+SchedulerEngine makeOptimized(const vector<ServerSpec>&sv,const vector<Job>&jb,const SchedulerParams&p){
+    return SchedulerEngine(sv,jb,p,nullptr,"best-fit",true);
+}
