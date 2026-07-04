@@ -1,12 +1,15 @@
 #include "scheduler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <climits>
 #include <stdexcept>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <functional>
+#include <limits>
 #include <unordered_set>
 
 using namespace std;
@@ -986,6 +989,589 @@ GreedyScheduler::Solution GreedyScheduler::generateMegascaleCriticalRatioList(in
     return sol;
 }
 
+vector<long long> GreedyScheduler::buildReleaseWaveQuantiles(int buckets) const {
+    vector<long long> releases;
+    releases.reserve(jobs.size());
+    for (const auto &job : jobs) releases.push_back(job.release_time);
+    if (releases.empty()) return {};
+    sort(releases.begin(), releases.end());
+    releases.erase(unique(releases.begin(), releases.end()), releases.end());
+    if ((int)releases.size() <= 1 || buckets <= 1) return releases;
+
+    vector<long long> quantiles;
+    quantiles.reserve(buckets - 1);
+    for (int b = 1; b < buckets; ++b) {
+        const size_t idx = min(releases.size() - 1,
+            (releases.size() * (size_t)b) / (size_t)buckets);
+        quantiles.push_back(releases[idx]);
+    }
+    return quantiles;
+}
+
+int GreedyScheduler::releaseWaveBucket(long long release_time,
+                                       const vector<long long> &quantiles) const {
+    int bucket = 0;
+    for (long long q : quantiles) {
+        if (release_time > q) ++bucket;
+        else break;
+    }
+    return bucket;
+}
+
+bool GreedyScheduler::jobCanUsePlacement(int job_id, int server_id, int gpu_used) const {
+    auto fm = feasible_machines.find(job_id);
+    if (fm == feasible_machines.end()) return false;
+    for (const auto &entry : fm->second) {
+        if (entry.first < 0 || entry.first >= (int)machines.size()) continue;
+        if (machines[entry.first].spec.server_id == server_id &&
+            entry.second == gpu_used) {
+            return true;
+        }
+    }
+    return false;
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleCoreAssignment(
+    int strategy_seed, int max_replays) {
+    Solution sol;
+    if (jobs.empty() || !isMegascaleInstance()) return sol;
+
+    vector<long long> impacts;
+    impacts.reserve(jobs.size());
+    for (const auto &job : jobs) {
+        impacts.push_back((long long)job.weight * job.duration);
+    }
+    const size_t mid = impacts.size() / 2;
+    nth_element(impacts.begin(), impacts.begin() + mid, impacts.end());
+    const long long impact_threshold = impacts[mid];
+
+    const double burst_w = profile.burst_t0_ratio;
+    const double spread_w = profile.release_spread_ratio;
+    const vector<long long> wave_quantiles = buildReleaseWaveQuantiles(
+        burst_w > 0.45 ? 5 : (spread_w > 0.50 ? 4 : 3));
+    const bool wave_first = burst_w > 0.28 || spread_w > 0.42;
+    const int sort_mode = strategy_seed % 3;
+
+    vector<int> order(jobs.size());
+    for (int i = 0; i < (int)jobs.size(); ++i) order[i] = i;
+    sort(order.begin(), order.end(), [this, sort_mode, wave_first, burst_w,
+            &wave_quantiles](int ia, int ib) {
+        const Job &a = jobs[ia];
+        const Job &b = jobs[ib];
+        if (wave_first && !wave_quantiles.empty()) {
+            int ba = releaseWaveBucket(a.release_time, wave_quantiles);
+            int bb = releaseWaveBucket(b.release_time, wave_quantiles);
+            if (ba != bb) return ba < bb;
+        } else if (wave_first && a.release_time != b.release_time) {
+            return a.release_time < b.release_time;
+        }
+        if (sort_mode == 1) {
+            if (a.weight != b.weight) return a.weight > b.weight;
+            if (a.duration != b.duration) return a.duration < b.duration;
+        } else if (sort_mode == 2) {
+            double pa = (double)a.weight / max(1.0, sqrt((double)a.duration));
+            double pb = (double)b.weight / max(1.0, sqrt((double)b.duration));
+            if (fabs(pa - pb) > 1e-9) return pa > pb;
+        } else {
+            long long wa = (long long)a.weight * a.duration;
+            long long wb = (long long)b.weight * b.duration;
+            if (wa != wb) return wa > wb;
+        }
+        if (!wave_first && a.release_time != b.release_time) {
+            return a.release_time < b.release_time;
+        }
+        return a.job_id < b.job_id;
+    });
+
+    vector<long long> projected_gpu_work(machines.size(), 0);
+    vector<MachineState> sim_machines = machines;
+    unordered_map<int, ScheduleRecord> records;
+    const double norm = max(1.0, (double)profile.time_horizon);
+    const double avg_dur = max(1.0, profile.avg_duration);
+    const double wait_boost = min(1.0, 0.52 + 0.24 * burst_w + 0.10 * spread_w);
+    const double load_coef = 0.30 + 0.20 * burst_w;
+    const double spread_coef = 0.14 + 0.26 * burst_w;
+
+    for (int oi : order) {
+        const Job &job = jobs[oi];
+        const long long job_time = job.release_time;
+        const long long job_impact = (long long)job.weight * job.duration;
+        const bool wait_primary = job_impact >= impact_threshold;
+        const bool spread_job = wait_primary && burst_w > 0.25;
+        vector<double> reservation_scores(machines.size(), 0.0);
+
+        double best_cost = 1e18;
+        PlacementPick best_pick = {-1, -1};
+        long long max_load = 1;
+        for (long long w : projected_gpu_work) max_load = max(max_load, w);
+
+        auto entries_it = feasible_machines.find(job.job_id);
+        if (entries_it != feasible_machines.end()) {
+            for (const auto &entry : entries_it->second) {
+                int mi = entry.first;
+                int gpu = entry.second;
+                if (!sim_machines[mi].canEverRun(job, gpu)) continue;
+
+                long long est = sim_machines[mi].earliestFeasibleStart(job, gpu, job_time);
+                if (est > LLONG_MAX / 8) continue;
+
+                const double wait_cost =
+                    (double)job.weight * max(0LL, est - job.release_time);
+                const double pc = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+                const double load = (double)projected_gpu_work[mi] /
+                    max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
+                const double impact_w = min(1.0, (double)job_impact /
+                    max(1.0, avg_dur * avg_dur * 40.0));
+
+                double cost;
+                if (wait_primary) {
+                    cost = wait_cost + 0.06 * pc * norm + 0.04 * load * impact_w * norm;
+                } else {
+                    cost = pc + wait_boost * 0.38 * wait_cost / max(1.0, norm) +
+                           load_coef * load * impact_w;
+                }
+                if (spread_job) {
+                    double rel_load = (double)projected_gpu_work[mi] / (double)max_load;
+                    cost += spread_coef * rel_load * rel_load * impact_w * norm;
+                }
+
+                if (cost < best_cost - 1e-9) {
+                    best_cost = cost;
+                    best_pick = {mi, gpu};
+                }
+            }
+        }
+
+        if (best_pick.machine_index < 0) continue;
+
+        long long start_t = sim_machines[best_pick.machine_index].earliestFeasibleStart(
+            job, best_pick.gpu_used, job_time);
+        auto result = sim_machines[best_pick.machine_index].startJob(
+            job, start_t, best_pick.gpu_used);
+        records[job.job_id] = result.first;
+        projected_gpu_work[best_pick.machine_index] +=
+            (long long)job.duration * best_pick.gpu_used;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+    if (sol.records.size() != jobs.size()) return sol;
+    if (max_replays == 0) return sol;
+    return runMegascaleAssignmentFirstPipeline(sol, max_replays);
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleWaveDispatchScheduler(
+    int policy_seed) {
+    Solution sol;
+    if (jobs.empty() || !isMegascaleInstance()) return sol;
+
+    const double burst_w = profile.burst_t0_ratio;
+    const double spread_w = profile.release_spread_ratio;
+    const double norm = max(1.0, (double)profile.time_horizon);
+    const double load_coef = 0.05 + 0.12 * burst_w;
+    const double spread_coef = 0.08 + 0.20 * burst_w;
+    const double wait_scale = (policy_seed % 3 == 0) ? 1.0
+        : (policy_seed % 3 == 1) ? 0.92 : 1.08;
+    const int prefilter_k = (jobs.size() > 4200) ? 14
+        : (jobs.size() > 3000) ? 20 : 28;
+
+    vector<long long> machine_gpu_work(machines.size(), 0);
+    long long current_time = jobs.front().release_time;
+    int next_job_index = 0;
+    vector<MachineState> sim_machines = machines;
+    unordered_map<int, ScheduleRecord> records;
+    priority_queue<FinishEvent, vector<FinishEvent>, greater<FinishEvent>> running_heap;
+    vector<Job> pool;
+
+    auto remove_from_pool = [&](int job_id) {
+        for (size_t i = 0; i < pool.size(); ++i) {
+            if (pool[i].job_id == job_id) {
+                pool[i] = pool.back();
+                pool.pop_back();
+                return;
+            }
+        }
+    };
+
+    while ((int)records.size() < (int)jobs.size()) {
+        while (!running_heap.empty() && running_heap.top().finish_time <= current_time) {
+            FinishEvent event = running_heap.top();
+            running_heap.pop();
+            auto it = machine_index_by_id.find(event.server_id);
+            if (it != machine_index_by_id.end()) {
+                sim_machines[it->second].releaseJob(event.running_job);
+            }
+        }
+
+        while (next_job_index < (int)jobs.size() &&
+               jobs[next_job_index].release_time <= current_time) {
+            pool.push_back(jobs[next_job_index]);
+            ++next_job_index;
+        }
+
+        while (!pool.empty()) {
+            vector<int> cand_idx(pool.size());
+            for (int i = 0; i < (int)pool.size(); ++i) cand_idx[i] = i;
+            if ((int)cand_idx.size() > prefilter_k) {
+                nth_element(cand_idx.begin(), cand_idx.begin() + prefilter_k, cand_idx.end(),
+                    [this, &pool, current_time](int ia, int ib) {
+                        const Job &a = pool[ia];
+                        const Job &b = pool[ib];
+                        long long wa = (long long)a.weight * a.duration;
+                        long long wb = (long long)b.weight * b.duration;
+                        if (wa != wb) return wa > wb;
+                        long long da = (long long)a.weight *
+                            max(0LL, current_time - a.release_time);
+                        long long db = (long long)b.weight *
+                            max(0LL, current_time - b.release_time);
+                        if (da != db) return da > db;
+                        return a.job_id < b.job_id;
+                    });
+                cand_idx.resize(prefilter_k);
+            }
+
+            int best_pi = -1;
+            double best_urgency = -1.0;
+            for (int pi : cand_idx) {
+                const Job &job = pool[pi];
+                auto fm = feasible_machines.find(job.job_id);
+                if (fm == feasible_machines.end()) continue;
+                bool any = false;
+                for (const auto &entry : fm->second) {
+                    if (sim_machines[entry.first].canStart(job, entry.second)) {
+                        any = true;
+                        break;
+                    }
+                }
+                if (!any) continue;
+
+                double rank_score = -1.0;
+                if (spread_w > 0.38 || (policy_seed % 3) == 2) {
+                    rank_score = criticalRatioPriority(job, sim_machines, current_time);
+                    if (rank_score < -1e17) continue;
+                } else {
+                    long long est = minEarliestStartForJob(job, sim_machines, current_time);
+                    if (est >= LLONG_MAX / 8) continue;
+                    rank_score = (double)job.weight * max(0LL, est - job.release_time) +
+                        0.001 * (double)job.weight * job.duration;
+                }
+
+                if (rank_score > best_urgency + 1e-9 ||
+                    (fabs(rank_score - best_urgency) <= 1e-9 &&
+                        (best_pi < 0 || job.job_id < pool[best_pi].job_id))) {
+                    best_urgency = rank_score;
+                    best_pi = pi;
+                }
+            }
+            if (best_pi < 0) break;
+
+            const Job &job = pool[best_pi];
+            auto fm = feasible_machines.find(job.job_id);
+            if (fm == feasible_machines.end()) {
+                remove_from_pool(job.job_id);
+                continue;
+            }
+
+            long long max_load = 1;
+            for (long long w : machine_gpu_work) max_load = max(max_load, w);
+
+            PlacementPick best_pick = {-1, -1};
+            double best_cost = 1e18;
+            long long best_start = LLONG_MAX;
+            vector<double> empty_res(machines.size(), 0.0);
+            const long long impact = (long long)job.weight * job.duration;
+
+            for (const auto &entry : fm->second) {
+                int mi = entry.first;
+                int gpu = entry.second;
+                if (!sim_machines[mi].canStart(job, gpu)) continue;
+                long long est = sim_machines[mi].earliestFeasibleStart(
+                    job, gpu, current_time);
+                if (est > LLONG_MAX / 8) continue;
+
+                const long long wait = (long long)job.weight *
+                    max(0LL, est - job.release_time);
+                double cost = wait_scale * (double)wait;
+
+                if (burst_w > 0.22) {
+                    double load = (double)machine_gpu_work[mi] /
+                        max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
+                    cost += load_coef * load * min(1.0,
+                        (double)impact / max(1.0, norm * profile.avg_duration));
+                }
+                if (burst_w > 0.28) {
+                    double rel = (double)machine_gpu_work[mi] / (double)max_load;
+                    cost += spread_coef * rel * rel * min(1.0,
+                        (double)impact / max(1.0, profile.avg_duration * profile.avg_duration * 20.0));
+                }
+                if (spread_w > 0.42) {
+                    cost += 0.025 * placementCost(job, mi, gpu, sim_machines, est,
+                        empty_res) * norm;
+                }
+                if (job.weight * job.duration >= (long long)profile.avg_duration * job.weight * 2) {
+                    double load = (double)machine_gpu_work[mi] /
+                        max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
+                    cost += 0.04 * load * (double)job.weight;
+                }
+
+                if (cost < best_cost - 1e-9 ||
+                    (fabs(cost - best_cost) <= 1e-9 && est < best_start)) {
+                    best_cost = cost;
+                    best_pick = {mi, gpu};
+                    best_start = est;
+                }
+            }
+
+            if (best_pick.machine_index < 0) break;
+            auto result = sim_machines[best_pick.machine_index].startJob(
+                job, best_start, best_pick.gpu_used);
+            records[job.job_id] = result.first;
+            running_heap.push(FinishEvent{result.second.finish_time, result.second.server_id,
+                result.second.job_id, result.second});
+            machine_gpu_work[best_pick.machine_index] +=
+                (long long)job.duration * best_pick.gpu_used;
+            remove_from_pool(job.job_id);
+        }
+
+        if ((int)records.size() >= (int)jobs.size()) break;
+
+        vector<long long> candidates;
+        if (next_job_index < (int)jobs.size())
+            candidates.push_back(jobs[next_job_index].release_time);
+        if (!running_heap.empty())
+            candidates.push_back(running_heap.top().finish_time);
+        long long next_t = -1;
+        for (long long c : candidates)
+            if (c > current_time && (next_t == -1 || c < next_t)) next_t = c;
+        if (next_t == -1) break;
+        current_time = next_t;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+    return sol;
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleUnifiedSolution() {
+    Solution best;
+    bool has_best = false;
+    auto consider = [&](Solution sol) {
+        if (sol.records.size() != jobs.size()) return;
+        computeMetrics(sol);
+        if (!has_best) {
+            best = sol;
+            has_best = true;
+            return;
+        }
+        if (isBetterSolution(sol, best)) best = sol;
+    };
+
+    consider(generateMegascaleDedicatedSolution());
+
+    if (!has_best) {
+        Solution fb = generateGreedySolutionWithStrategy(42, 2);
+        if (fb.records.size() == jobs.size()) consider(fb);
+    }
+    return best;
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleWaveAssignReplay(
+    int policy_seed) {
+    Solution wave = generateMegascaleWaveDispatchScheduler(policy_seed);
+    if (wave.records.size() != jobs.size()) return wave;
+
+    Solution best = wave;
+    computeMetrics(best);
+
+    static const int modes[] = {4, 0, 2};
+    const int n = (jobs.size() > 4200) ? 1 : 2;
+    for (int i = 0; i < n; ++i) {
+        Solution alt = wave;
+        replayMegascaleAssignmentList(alt, modes[i]);
+        if (alt.records.size() != jobs.size()) continue;
+        computeMetrics(alt);
+        if (isBetterSolution(alt, best)) best = alt;
+    }
+    return best;
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleIntegratedTimeline(
+    int policy_seed) {
+    Solution timeline = generateMegascaleWaveDispatchScheduler(policy_seed);
+    if (timeline.records.size() != jobs.size()) return timeline;
+    return runMegascaleAssignmentFirstPipeline(timeline, 1);
+}
+
+GreedyScheduler::Solution GreedyScheduler::refineMegascaleReplayBeamSearch(
+    const Solution &initial, int budget_ms) {
+    if (!isMegascaleInstance() || budget_ms <= 0) return initial;
+    if (initial.records.size() != jobs.size() || !isScheduleValid(initial)) return initial;
+    if (jobs.size() < 2800 || jobs.size() > 3800) return initial;
+
+    const auto deadline = chrono::steady_clock::now() +
+        chrono::milliseconds(budget_ms);
+
+    Solution best = initial;
+    computeMetrics(best);
+
+    struct JobMove {
+        size_t rec_idx = 0;
+        int server_id = -1;
+        int gpu = -1;
+    };
+
+    vector<size_t> job_order(initial.records.size());
+    for (size_t i = 0; i < job_order.size(); ++i) job_order[i] = i;
+    sort(job_order.begin(), job_order.end(), [this, &initial](size_t a, size_t b) {
+        const Job *ja = job_by_id.count(initial.records[a].job_id)
+            ? job_by_id.at(initial.records[a].job_id) : nullptr;
+        const Job *jb = job_by_id.count(initial.records[b].job_id)
+            ? job_by_id.at(initial.records[b].job_id) : nullptr;
+        if (!ja || !jb) return a < b;
+        long long wa = (long long)ja->weight *
+            max(0LL, initial.records[a].start_time - ja->release_time);
+        long long wb = (long long)jb->weight *
+            max(0LL, initial.records[b].start_time - jb->release_time);
+        if (wa != wb) return wa > wb;
+        long long ia = (long long)ja->weight * ja->duration;
+        long long ib = (long long)jb->weight * jb->duration;
+        if (ia != ib) return ia > ib;
+        return ja->job_id < jb->job_id;
+    });
+
+    const int top_jobs = (jobs.size() > 3200) ? 4 : 5;
+    const int beam_width = (jobs.size() > 3200) ? 3 : 4;
+    const int depth = (jobs.size() > 3200) ? 2 : 3;
+    const int replay_mode = 4;
+
+    if ((int)job_order.size() > top_jobs) job_order.resize(top_jobs);
+
+    vector<vector<JobMove>> layers;
+    layers.reserve(job_order.size());
+    for (size_t idx : job_order) {
+        if (chrono::steady_clock::now() >= deadline) break;
+        const int job_id = initial.records[idx].job_id;
+        const Job *job = job_by_id.count(job_id) ? job_by_id.at(job_id) : nullptr;
+        if (!job) continue;
+
+        auto fm = feasible_machines.find(job_id);
+        if (fm == feasible_machines.end() || fm->second.size() <= 1) continue;
+
+        vector<JobMove> moves;
+        JobMove cur;
+        cur.rec_idx = idx;
+        cur.server_id = initial.records[idx].server_id;
+        cur.gpu = initial.records[idx].gpu_used;
+        moves.push_back(cur);
+
+        struct ScoredMove {
+            JobMove move;
+            double ww = 1e18;
+        };
+        vector<ScoredMove> scored;
+        scored.reserve(fm->second.size());
+
+        for (const auto &entry : fm->second) {
+            if (entry.first < 0 || entry.first >= (int)machines.size()) continue;
+            if (machines[entry.first].spec.server_id == cur.server_id &&
+                entry.second == cur.gpu) {
+                continue;
+            }
+            if (!jobCanUsePlacement(job_id, machines[entry.first].spec.server_id,
+                                   entry.second)) {
+                continue;
+            }
+            ScoredMove sm;
+            sm.move.rec_idx = idx;
+            sm.move.server_id = machines[entry.first].spec.server_id;
+            sm.move.gpu = entry.second;
+
+            Solution trial = initial;
+            trial.records[idx].server_id = sm.move.server_id;
+            trial.records[idx].gpu_used = sm.move.gpu;
+            replayMegascaleAssignmentList(trial, replay_mode);
+            if (trial.records.size() != jobs.size()) continue;
+            computeMetrics(trial);
+            sm.ww = trial.weighted_waiting;
+            scored.push_back(sm);
+            if (isBetterSolution(trial, best)) best = trial;
+        }
+
+        sort(scored.begin(), scored.end(), [](const ScoredMove &a, const ScoredMove &b) {
+            return a.ww < b.ww;
+        });
+        const int alt_cap = (jobs.size() > 3200) ? 2 : 3;
+        for (int i = 0; i < min(alt_cap, (int)scored.size()); ++i) {
+            moves.push_back(scored[i].move);
+        }
+        if (moves.size() > 1) layers.push_back(std::move(moves));
+    }
+
+    if (layers.empty()) return best;
+
+    vector<Solution> beam;
+    beam.push_back(initial);
+    computeMetrics(beam[0]);
+
+    const int max_depth = min(depth, (int)layers.size());
+    for (int d = 0; d < max_depth; ++d) {
+        if (chrono::steady_clock::now() >= deadline) break;
+        vector<Solution> next_beam;
+        next_beam.reserve(beam.size() * layers[d].size());
+
+        for (const Solution &state : beam) {
+            if (chrono::steady_clock::now() >= deadline) break;
+            for (const JobMove &mv : layers[d]) {
+                Solution trial = state;
+                trial.records[mv.rec_idx].server_id = mv.server_id;
+                trial.records[mv.rec_idx].gpu_used = mv.gpu;
+                replayMegascaleAssignmentList(trial, replay_mode);
+                if (trial.records.size() != jobs.size()) continue;
+                computeMetrics(trial);
+                if (isBetterSolution(trial, best)) best = trial;
+                next_beam.push_back(trial);
+            }
+        }
+        if (next_beam.empty()) break;
+
+        sort(next_beam.begin(), next_beam.end(), [this](const Solution &a, const Solution &b) {
+            Solution ca = a;
+            Solution cb = b;
+            computeMetrics(ca);
+            computeMetrics(cb);
+            return ca.weighted_waiting < cb.weighted_waiting;
+        });
+        if ((int)next_beam.size() > beam_width) next_beam.resize(beam_width);
+        beam = std::move(next_beam);
+    }
+
+    return best;
+}
+
+void GreedyScheduler::polishMegascaleLight(Solution &best) {
+    if (!isMegascaleInstance() || !isScheduleValid(best) || best.records.empty()) return;
+
+    Solution result = best;
+    computeMetrics(result);
+
+    static const int modes[] = {4, 0};
+    const int n = (jobs.size() > 4200) ? 1 : 2;
+    for (int i = 0; i < n; ++i) {
+        Solution alt = best;
+        replayMegascaleAssignmentList(alt, modes[i]);
+        if (alt.records.size() != jobs.size()) continue;
+        computeMetrics(alt);
+        if (isBetterSolution(alt, result)) result = alt;
+    }
+    best = result;
+}
+
 GreedyScheduler::Solution GreedyScheduler::generateMegascaleBalancedAssignment(
     int strategy_seed, int max_replays) {
     Solution sol;
@@ -1034,16 +1620,14 @@ GreedyScheduler::Solution GreedyScheduler::generateMegascaleBalancedAssignment(
                 long long est = sim_machines[mi].earliestFeasibleStart(job, gpu, job_time);
                 if (est > LLONG_MAX / 8) continue;
 
-                double cost = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+                double pc = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+                double cost = pc;
                 double wait = (double)(est - job.release_time) / norm;
-                cost += 0.38 * wait * min(1.0, (double)job.weight);
+                cost += 0.45 * wait * min(1.0, (double)job.weight);
                 double load = (double)projected_gpu_work[mi] /
                     max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
-                cost += 0.34 * load * min(1.0, (double)job.weight * job.duration /
+                cost += 0.38 * load * min(1.0, (double)job.weight * job.duration /
                     max(1.0, avg_dur * avg_dur * 40.0));
-                long long est_start = est;
-                cost += 0.12 * estStartPlacementAdjust(
-                    job, mi, gpu, sim_machines, est_start, true);
                 if (cost < best_cost - 1e-9) {
                     best_cost = cost;
                     best_pick = {mi, gpu};
@@ -1069,6 +1653,741 @@ GreedyScheduler::Solution GreedyScheduler::generateMegascaleBalancedAssignment(
     if (sol.records.size() != jobs.size()) return sol;
     if (max_replays == 0) return sol;
     return runAssignmentFirstPipeline(sol, max_replays);
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleAdaptiveWaitAssignment(
+    int strategy_seed, int max_replays) {
+    Solution sol;
+    if (jobs.empty() || !isMegascaleInstance()) return sol;
+
+    vector<long long> impacts;
+    impacts.reserve(jobs.size());
+    for (const auto &job : jobs) {
+        impacts.push_back((long long)job.weight * job.duration);
+    }
+    const size_t mid = impacts.size() / 2;
+    nth_element(impacts.begin(), impacts.begin() + mid, impacts.end());
+    const long long impact_threshold = impacts[mid];
+
+    vector<int> order(jobs.size());
+    for (int i = 0; i < (int)jobs.size(); ++i) order[i] = i;
+    const int sort_mode = strategy_seed % 3;
+    sort(order.begin(), order.end(), [this, sort_mode](int ia, int ib) {
+        const Job &a = jobs[ia];
+        const Job &b = jobs[ib];
+        if (sort_mode == 1) {
+            if (a.weight != b.weight) return a.weight > b.weight;
+            if (a.duration != b.duration) return a.duration < b.duration;
+        } else if (sort_mode == 2) {
+            double pa = (double)a.weight / max(1.0, sqrt((double)a.duration));
+            double pb = (double)b.weight / max(1.0, sqrt((double)b.duration));
+            if (fabs(pa - pb) > 1e-9) return pa > pb;
+        } else {
+            long long wa = (long long)a.weight * a.duration;
+            long long wb = (long long)b.weight * b.duration;
+            if (wa != wb) return wa > wb;
+        }
+        if (a.release_time != b.release_time) return a.release_time < b.release_time;
+        return a.job_id < b.job_id;
+    });
+
+    vector<long long> projected_gpu_work(machines.size(), 0);
+    vector<MachineState> sim_machines = machines;
+    unordered_map<int, ScheduleRecord> records;
+    const double norm = max(1.0, (double)profile.time_horizon);
+    const double avg_dur = max(1.0, profile.avg_duration);
+    const double wait_boost = min(1.0, 0.55 + 0.25 * profile.burst_t0_ratio);
+
+    for (int oi : order) {
+        const Job &job = jobs[oi];
+        const long long job_time = job.release_time;
+        const long long job_impact = (long long)job.weight * job.duration;
+        const bool wait_primary = job_impact >= impact_threshold;
+        vector<double> reservation_scores(machines.size(), 0.0);
+
+        double best_cost = 1e18;
+        PlacementPick best_pick = {-1, -1};
+        long long best_start = job_time;
+
+        auto entries_it = feasible_machines.find(job.job_id);
+        if (entries_it != feasible_machines.end()) {
+            for (const auto &entry : entries_it->second) {
+                int mi = entry.first;
+                int gpu = entry.second;
+                if (!sim_machines[mi].canEverRun(job, gpu)) continue;
+
+                long long est = sim_machines[mi].earliestFeasibleStart(job, gpu, job_time);
+                if (est > LLONG_MAX / 8) continue;
+
+                const double wait_cost =
+                    (double)job.weight * max(0LL, est - job.release_time);
+                const double pc = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+                const double load = (double)projected_gpu_work[mi] /
+                    max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
+                const double impact_w = min(1.0, (double)job_impact /
+                    max(1.0, avg_dur * avg_dur * 40.0));
+
+                double cost;
+                if (wait_primary) {
+                    cost = wait_cost + 0.07 * pc * norm + 0.05 * load * impact_w * norm;
+                } else {
+                    cost = pc + wait_boost * 0.40 * wait_cost / max(1.0, norm) +
+                           0.34 * load * impact_w;
+                }
+
+                if (cost < best_cost - 1e-9) {
+                    best_cost = cost;
+                    best_pick = {mi, gpu};
+                    best_start = est;
+                }
+            }
+        }
+
+        if (best_pick.machine_index < 0) continue;
+
+        auto result = sim_machines[best_pick.machine_index].startJob(
+            job, best_start, best_pick.gpu_used);
+        records[job.job_id] = result.first;
+        projected_gpu_work[best_pick.machine_index] +=
+            (long long)job.duration * best_pick.gpu_used;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+    if (sol.records.size() != jobs.size()) return sol;
+    if (max_replays == 0) return sol;
+    return runMegascaleAssignmentFirstPipeline(sol, max_replays);
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleProfileAwareAssignment(
+    int strategy_seed, int max_replays) {
+    Solution sol;
+    if (jobs.empty() || !isMegascaleInstance()) return sol;
+
+    vector<long long> impacts;
+    impacts.reserve(jobs.size());
+    for (const auto &job : jobs) {
+        impacts.push_back((long long)job.weight * job.duration);
+    }
+    const size_t mid = impacts.size() / 2;
+    nth_element(impacts.begin(), impacts.begin() + mid, impacts.end());
+    const long long impact_threshold = impacts[mid];
+
+    vector<int> order(jobs.size());
+    for (int i = 0; i < (int)jobs.size(); ++i) order[i] = i;
+
+    const double burst_w = profile.burst_t0_ratio;
+    const double spread_w = profile.release_spread_ratio;
+    const vector<long long> wave_quantiles = buildReleaseWaveQuantiles(
+        burst_w > 0.45 ? 5 : (spread_w > 0.50 ? 4 : 3));
+    const bool wave_release_first = burst_w > 0.28 || spread_w > 0.42;
+    const bool spread_heavy = spread_w > 0.48;
+    const int sort_mode = strategy_seed % 3;
+
+    sort(order.begin(), order.end(), [this, sort_mode, wave_release_first, spread_heavy,
+            &wave_quantiles](int ia, int ib) {
+        const Job &a = jobs[ia];
+        const Job &b = jobs[ib];
+        if (wave_release_first && !wave_quantiles.empty()) {
+            int ba = releaseWaveBucket(a.release_time, wave_quantiles);
+            int bb = releaseWaveBucket(b.release_time, wave_quantiles);
+            if (ba != bb) return ba < bb;
+        } else if (wave_release_first) {
+            if (a.release_time != b.release_time) return a.release_time < b.release_time;
+        }
+        if (sort_mode == 1 || spread_heavy) {
+            if (a.weight != b.weight) return a.weight > b.weight;
+            if (a.duration != b.duration) return a.duration < b.duration;
+        } else if (sort_mode == 2) {
+            double pa = (double)a.weight / max(1.0, sqrt((double)a.duration));
+            double pb = (double)b.weight / max(1.0, sqrt((double)b.duration));
+            if (fabs(pa - pb) > 1e-9) return pa > pb;
+        } else {
+            long long wa = (long long)a.weight * a.duration;
+            long long wb = (long long)b.weight * b.duration;
+            if (wa != wb) return wa > wb;
+        }
+        if (!wave_release_first && a.release_time != b.release_time) {
+            return a.release_time < b.release_time;
+        }
+        return a.job_id < b.job_id;
+    });
+
+    vector<long long> projected_gpu_work(machines.size(), 0);
+    vector<MachineState> sim_machines = machines;
+    unordered_map<int, ScheduleRecord> records;
+    const double norm = max(1.0, (double)profile.time_horizon);
+    const double avg_dur = max(1.0, profile.avg_duration);
+    const double wait_coef = 0.36 + 0.28 * burst_w + 0.14 * spread_w;
+    const double load_coef = 0.26 + 0.22 * burst_w;
+    const double spread_coef = 0.12 + 0.28 * burst_w;
+    const double wait_primary_boost = min(1.0, 0.50 + 0.22 * burst_w);
+
+    for (int oi : order) {
+        const Job &job = jobs[oi];
+        const long long job_time = job.release_time;
+        const long long job_impact = (long long)job.weight * job.duration;
+        const bool wait_primary = job_impact >= impact_threshold;
+        const bool spread_job = wait_primary && burst_w > 0.25;
+        vector<double> reservation_scores(machines.size(), 0.0);
+
+        double best_cost = 1e18;
+        PlacementPick best_pick = {-1, -1};
+        long long best_start = job_time;
+
+        long long max_load = 1;
+        for (long long w : projected_gpu_work) max_load = max(max_load, w);
+
+        auto entries_it = feasible_machines.find(job.job_id);
+        if (entries_it != feasible_machines.end()) {
+            for (const auto &entry : entries_it->second) {
+                int mi = entry.first;
+                int gpu = entry.second;
+                if (!sim_machines[mi].canEverRun(job, gpu)) continue;
+
+                long long est = sim_machines[mi].earliestFeasibleStart(job, gpu, job_time);
+                if (est > LLONG_MAX / 8) continue;
+
+                const double wait_cost =
+                    (double)job.weight * max(0LL, est - job.release_time);
+                const double pc = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+                const double load = (double)projected_gpu_work[mi] /
+                    max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
+                const double impact_w = min(1.0, (double)job_impact /
+                    max(1.0, avg_dur * avg_dur * 40.0));
+
+                double cost;
+                if (wait_primary) {
+                    cost = wait_cost + 0.06 * pc * norm + 0.04 * load * impact_w * norm;
+                } else {
+                    cost = pc + wait_coef * wait_cost / max(1.0, norm) +
+                           load_coef * load * impact_w;
+                }
+                if (spread_job) {
+                    double rel_load = (double)projected_gpu_work[mi] / (double)max_load;
+                    cost += spread_coef * rel_load * rel_load * impact_w * norm;
+                }
+                if (!wait_primary && spread_heavy) {
+                    cost += wait_primary_boost * 0.18 * wait_cost / max(1.0, norm);
+                }
+
+                if (cost < best_cost - 1e-9) {
+                    best_cost = cost;
+                    best_pick = {mi, gpu};
+                    best_start = est;
+                }
+            }
+        }
+
+        if (best_pick.machine_index < 0) continue;
+
+        auto result = sim_machines[best_pick.machine_index].startJob(
+            job, best_start, best_pick.gpu_used);
+        records[job.job_id] = result.first;
+        projected_gpu_work[best_pick.machine_index] +=
+            (long long)job.duration * best_pick.gpu_used;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+    if (sol.records.size() != jobs.size()) return sol;
+    if (max_replays == 0) return sol;
+    return runMegascaleAssignmentFirstPipeline(sol, max_replays);
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleBurstWaveAssignment(
+    int strategy_seed, int max_replays) {
+    Solution sol;
+    if (jobs.empty() || !isMegascaleInstance()) return sol;
+    if (profile.burst_t0_ratio < 0.35) return sol;
+
+    vector<long long> impacts;
+    impacts.reserve(jobs.size());
+    for (const auto &job : jobs) {
+        impacts.push_back((long long)job.weight * job.duration);
+    }
+    const size_t mid = impacts.size() / 2;
+    nth_element(impacts.begin(), impacts.begin() + mid, impacts.end());
+    const long long impact_threshold = impacts[mid];
+
+    vector<int> order(jobs.size());
+    for (int i = 0; i < (int)jobs.size(); ++i) order[i] = i;
+    const bool weight_first = (strategy_seed % 2) == 0;
+    sort(order.begin(), order.end(), [this, weight_first](int ia, int ib) {
+        const Job &a = jobs[ia];
+        const Job &b = jobs[ib];
+        if (a.release_time != b.release_time) return a.release_time < b.release_time;
+        if (weight_first) {
+            long long wa = (long long)a.weight * a.duration;
+            long long wb = (long long)b.weight * b.duration;
+            if (wa != wb) return wa > wb;
+        } else if (a.weight != b.weight) {
+            return a.weight > b.weight;
+        }
+        return a.job_id < b.job_id;
+    });
+
+    vector<long long> projected_gpu_work(machines.size(), 0);
+    vector<MachineState> sim_machines = machines;
+    unordered_map<int, ScheduleRecord> records;
+    const double norm = max(1.0, (double)profile.time_horizon);
+    const double avg_dur = max(1.0, profile.avg_duration);
+    const double burst_w = profile.burst_t0_ratio;
+    const double wait_coef = 0.38 + 0.40 * burst_w;
+    const double spread_coef = 0.30 + 0.25 * burst_w;
+
+    for (int oi : order) {
+        const Job &job = jobs[oi];
+        const long long job_time = job.release_time;
+        const long long job_impact = (long long)job.weight * job.duration;
+        const bool spread_job = job_impact >= impact_threshold;
+        vector<double> reservation_scores(machines.size(), 0.0);
+
+        double best_cost = 1e18;
+        PlacementPick best_pick = {-1, -1};
+        long long best_start = job_time;
+
+        long long max_load = 1;
+        for (long long w : projected_gpu_work) max_load = max(max_load, w);
+
+        auto entries_it = feasible_machines.find(job.job_id);
+        if (entries_it != feasible_machines.end()) {
+            for (const auto &entry : entries_it->second) {
+                int mi = entry.first;
+                int gpu = entry.second;
+                if (!sim_machines[mi].canEverRun(job, gpu)) continue;
+
+                long long est = sim_machines[mi].earliestFeasibleStart(job, gpu, job_time);
+                if (est > LLONG_MAX / 8) continue;
+
+                double pc = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+                double cost = pc;
+                const double wait = (double)(est - job.release_time) / norm;
+                cost += wait_coef * wait * min(1.0, (double)job.weight);
+                double load = (double)projected_gpu_work[mi] /
+                    max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
+                cost += 0.32 * load * min(1.0, (double)job_impact /
+                    max(1.0, avg_dur * avg_dur * 40.0));
+                if (spread_job) {
+                    double rel_load = (double)projected_gpu_work[mi] / (double)max_load;
+                    cost += spread_coef * rel_load * min(1.0, (double)job.weight);
+                }
+                if (cost < best_cost - 1e-9) {
+                    best_cost = cost;
+                    best_pick = {mi, gpu};
+                    best_start = est;
+                }
+            }
+        }
+
+        if (best_pick.machine_index < 0) continue;
+
+        auto result = sim_machines[best_pick.machine_index].startJob(
+            job, best_start, best_pick.gpu_used);
+        records[job.job_id] = result.first;
+        projected_gpu_work[best_pick.machine_index] +=
+            (long long)job.duration * best_pick.gpu_used;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+    if (sol.records.size() != jobs.size()) return sol;
+    if (max_replays == 0) return sol;
+    return runMegascaleAssignmentFirstPipeline(sol, max_replays);
+}
+
+GreedyScheduler::Solution GreedyScheduler::mergeMegascaleDualAssignment(
+    const Solution &balanced_src, const Solution &adaptive_src) {
+    if (balanced_src.records.size() != jobs.size() ||
+        adaptive_src.records.size() != jobs.size()) {
+        return pickBetterSolution(balanced_src, adaptive_src);
+    }
+
+    Solution trial = balanced_src;
+    unordered_map<int, pair<int, int>> adaptive_assign;
+    for (const auto &rec : adaptive_src.records) {
+        adaptive_assign[rec.job_id] = {rec.server_id, rec.gpu_used};
+    }
+
+    vector<int> impact_ids;
+    impact_ids.reserve(trial.records.size());
+    for (const auto &rec : trial.records) impact_ids.push_back(rec.job_id);
+    const int top_k = max(8, (int)(jobs.size() * 0.015));
+    sort(impact_ids.begin(), impact_ids.end(), [this](int a, int b) {
+        const Job *ja = job_by_id.count(a) ? job_by_id.at(a) : nullptr;
+        const Job *jb = job_by_id.count(b) ? job_by_id.at(b) : nullptr;
+        if (!ja || !jb) return a < b;
+        long long wa = (long long)ja->weight * ja->duration;
+        long long wb = (long long)jb->weight * jb->duration;
+        if (wa != wb) return wa > wb;
+        return ja->job_id < jb->job_id;
+    });
+    if ((int)impact_ids.size() > top_k) impact_ids.resize(top_k);
+
+    unordered_map<int, size_t> record_index;
+    for (size_t i = 0; i < trial.records.size(); ++i) {
+        record_index[trial.records[i].job_id] = i;
+    }
+
+    for (int job_id : impact_ids) {
+        auto adp_it = adaptive_assign.find(job_id);
+        auto idx_it = record_index.find(job_id);
+        if (adp_it == adaptive_assign.end() || idx_it == record_index.end()) continue;
+
+        const Job *job = job_by_id.count(job_id) ? job_by_id.at(job_id) : nullptr;
+        if (!job) continue;
+
+        const auto &cur = trial.records[idx_it->second];
+        if (cur.server_id == adp_it->second.first &&
+            cur.gpu_used == adp_it->second.second) {
+            continue;
+        }
+
+        auto cur_mach = machine_index_by_id.find(cur.server_id);
+        auto adp_mach = machine_index_by_id.find(adp_it->second.first);
+        if (cur_mach == machine_index_by_id.end() ||
+            adp_mach == machine_index_by_id.end()) {
+            continue;
+        }
+
+        long long cur_est = machines[cur_mach->second].earliestFeasibleStart(
+            *job, cur.gpu_used, job->release_time);
+        long long adp_est = machines[adp_mach->second].earliestFeasibleStart(
+            *job, adp_it->second.second, job->release_time);
+
+        long long cur_wait = (long long)job->weight * max(0LL, cur_est - job->release_time);
+        long long adp_wait = (long long)job->weight * max(0LL, adp_est - job->release_time);
+        if (adp_wait < cur_wait) {
+            trial.records[idx_it->second].server_id = adp_it->second.first;
+            trial.records[idx_it->second].gpu_used = adp_it->second.second;
+        }
+    }
+
+    replayMegascaleAssignmentList(trial, (jobs.size() > 4200) ? 0 : 4);
+    if (trial.records.size() != jobs.size()) return balanced_src;
+
+    computeMetrics(trial);
+    Solution best = balanced_src;
+    computeMetrics(best);
+    if (isBetterSolution(trial, best)) best = trial;
+
+    Solution adaptive_copy = adaptive_src;
+    computeMetrics(adaptive_copy);
+    if (isBetterSolution(adaptive_copy, best)) best = adaptive_copy;
+    return best;
+}
+
+GreedyScheduler::PlacementPick GreedyScheduler::chooseWaitOptPlacement(
+    const Job &job,
+    const vector<MachineState> &sim_machines,
+    long long current_time,
+    const vector<double> &reservation_scores) const {
+    PlacementPick best = {-1, -1};
+    double best_cost = 1e18;
+    long long best_start = LLONG_MAX;
+
+    auto entries_it = feasible_machines.find(job.job_id);
+    if (entries_it == feasible_machines.end()) return best;
+
+    const double norm = max(1.0, (double)profile.time_horizon);
+    for (const auto &entry : entries_it->second) {
+        int mi = entry.first;
+        int gpu = entry.second;
+        if (!sim_machines[mi].canEverRun(job, gpu)) continue;
+
+        long long est = sim_machines[mi].earliestFeasibleStart(job, gpu, current_time);
+        if (est > LLONG_MAX / 8) continue;
+
+        const double wait_cost =
+            (double)job.weight * max(0LL, est - job.release_time);
+        const double pc = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+        const double load =
+            (double)sim_machines[mi].totalRemainingGpuWork(current_time) /
+            max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
+        const double impact_w = min(1.0, (double)job.weight * job.duration /
+            max(1.0, profile.avg_duration * profile.avg_duration * 40.0));
+        const double cost = wait_cost + 0.08 * pc * norm + 0.06 * load * impact_w * norm;
+
+        if (cost < best_cost - 1e-9 ||
+            (fabs(cost - best_cost) <= 1e-9 && est < best_start)) {
+            best_cost = cost;
+            best = {mi, gpu};
+            best_start = est;
+        }
+    }
+    return best;
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleWaitOptAssignment(
+    int strategy_seed, int max_replays) {
+    Solution sol;
+    if (jobs.empty() || !isMegascaleInstance()) return sol;
+
+    vector<int> order(jobs.size());
+    for (int i = 0; i < (int)jobs.size(); ++i) order[i] = i;
+    const int sort_mode = strategy_seed % 3;
+    sort(order.begin(), order.end(), [this, sort_mode](int ia, int ib) {
+        const Job &a = jobs[ia];
+        const Job &b = jobs[ib];
+        if (sort_mode == 0) {
+            if (a.release_time != b.release_time) return a.release_time < b.release_time;
+            long long wa = (long long)a.weight * a.duration;
+            long long wb = (long long)b.weight * b.duration;
+            if (wa != wb) return wa > wb;
+        } else if (sort_mode == 1) {
+            double pa = (double)a.weight / max(1.0, sqrt((double)a.duration));
+            double pb = (double)b.weight / max(1.0, sqrt((double)b.duration));
+            if (fabs(pa - pb) > 1e-9) return pa > pb;
+            if (a.release_time != b.release_time) return a.release_time < b.release_time;
+        } else {
+            long long wa = (long long)a.weight * a.duration;
+            long long wb = (long long)b.weight * b.duration;
+            if (wa != wb) return wa > wb;
+            if (a.release_time != b.release_time) return a.release_time < b.release_time;
+        }
+        return a.job_id < b.job_id;
+    });
+
+    vector<long long> projected_gpu_work(machines.size(), 0);
+    vector<MachineState> sim_machines = machines;
+    unordered_map<int, ScheduleRecord> records;
+    const double norm = max(1.0, (double)profile.time_horizon);
+
+    for (int oi : order) {
+        const Job &job = jobs[oi];
+        const long long job_time = max((long long)job.release_time, (long long)jobs.front().release_time);
+        vector<double> reservation_scores(machines.size(), 0.0);
+
+        double best_cost = 1e18;
+        PlacementPick best_pick = {-1, -1};
+        long long best_start = job_time;
+
+        auto entries_it = feasible_machines.find(job.job_id);
+        if (entries_it != feasible_machines.end()) {
+            for (const auto &entry : entries_it->second) {
+                int mi = entry.first;
+                int gpu = entry.second;
+                if (!sim_machines[mi].canEverRun(job, gpu)) continue;
+
+                long long est = sim_machines[mi].earliestFeasibleStart(job, gpu, job_time);
+                if (est > LLONG_MAX / 8) continue;
+
+                const double wait_cost =
+                    (double)job.weight * max(0LL, est - job.release_time);
+                const double pc = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+                const double load = (double)projected_gpu_work[mi] /
+                    max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
+                const double impact_w = min(1.0, (double)job.weight * job.duration /
+                    max(1.0, profile.avg_duration * profile.avg_duration * 40.0));
+                const double cost = wait_cost + 0.08 * pc * norm + 0.06 * load * impact_w * norm;
+
+                if (cost < best_cost - 1e-9) {
+                    best_cost = cost;
+                    best_pick = {mi, gpu};
+                    best_start = est;
+                }
+            }
+        }
+
+        if (best_pick.machine_index < 0) continue;
+
+        auto result = sim_machines[best_pick.machine_index].startJob(
+            job, best_start, best_pick.gpu_used);
+        records[job.job_id] = result.first;
+        projected_gpu_work[best_pick.machine_index] +=
+            (long long)job.duration * best_pick.gpu_used;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+    if (sol.records.size() != jobs.size()) return sol;
+    if (max_replays == 0) return sol;
+    return runAssignmentFirstPipeline(sol, max_replays);
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateMegascaleOnlineWaitList(int strategy_seed) {
+    Solution sol;
+    if (jobs.empty() || !isMegascaleInstance()) return sol;
+
+    const int pool_cap = (jobs.size() > 4500) ? 8
+        : (jobs.size() > 2800) ? 10 : (jobs.size() > 2000) ? 14 : 24;
+    const int prefilter = min((int)jobs.size(), pool_cap * 3);
+    const int variant = strategy_seed % 3;
+
+    auto pending_priority = [this, variant](
+            const Job &a, const Job &b,
+            const vector<MachineState> &sim_machines, long long current_time) {
+        if (variant == 1) {
+            long long ea = minEarliestStartForJob(a, sim_machines, current_time);
+            long long eb = minEarliestStartForJob(b, sim_machines, current_time);
+            long long da = (long long)a.weight *
+                max(0LL, ea - max(current_time, (long long)a.release_time));
+            long long db = (long long)b.weight *
+                max(0LL, eb - max(current_time, (long long)b.release_time));
+            if (da != db) return da > db;
+        } else if (variant == 2) {
+            long long wa = (long long)a.weight * a.duration;
+            long long wb = (long long)b.weight * b.duration;
+            if (wa != wb) return wa > wb;
+        } else {
+            double pa = criticalRatioPriority(a, sim_machines, current_time);
+            double pb = criticalRatioPriority(b, sim_machines, current_time);
+            if (fabs(pa - pb) > 1e-9) return pa > pb;
+        }
+        if (a.release_time != b.release_time) return a.release_time < b.release_time;
+        return a.job_id < b.job_id;
+    };
+
+    long long current_time = jobs.front().release_time;
+    int next_job_index = 0;
+    vector<MachineState> sim_machines = machines;
+    unordered_map<int, ScheduleRecord> records;
+    priority_queue<FinishEvent, vector<FinishEvent>, greater<FinishEvent>> running_heap;
+    vector<Job> pool;
+    int spin_rounds = 0;
+    const int spin_cap = (jobs.size() > 3500) ? 2 : 3;
+
+    while ((int)records.size() < (int)jobs.size()) {
+        while (!running_heap.empty() && running_heap.top().finish_time <= current_time) {
+            FinishEvent event = running_heap.top();
+            running_heap.pop();
+            auto it = machine_index_by_id.find(event.server_id);
+            if (it != machine_index_by_id.end()) {
+                sim_machines[it->second].releaseJob(event.running_job);
+            }
+        }
+
+        while (next_job_index < (int)jobs.size() &&
+               jobs[next_job_index].release_time <= current_time) {
+            pool.push_back(jobs[next_job_index]);
+            ++next_job_index;
+        }
+
+        if (pool.empty()) {
+            vector<long long> candidates;
+            if (next_job_index < (int)jobs.size())
+                candidates.push_back(jobs[next_job_index].release_time);
+            if (!running_heap.empty())
+                candidates.push_back(running_heap.top().finish_time);
+            long long next_t = -1;
+            for (long long c : candidates)
+                if (c > current_time && (next_t == -1 || c < next_t)) next_t = c;
+            if (next_t == -1) break;
+            current_time = next_t;
+            continue;
+        }
+
+        vector<Job> candidates = pool;
+        if ((int)candidates.size() > prefilter) {
+            nth_element(candidates.begin(), candidates.begin() + prefilter, candidates.end(),
+                        [&](const Job &a, const Job &b) {
+                return pending_priority(a, b, sim_machines, current_time);
+            });
+            candidates.resize(prefilter);
+        }
+
+        vector<int> perm(candidates.size());
+        for (size_t i = 0; i < perm.size(); ++i) perm[i] = (int)i;
+        sort(perm.begin(), perm.end(), [&](int ia, int ib) {
+            return pending_priority(candidates[ia], candidates[ib], sim_machines, current_time);
+        });
+
+        vector<Job> to_try;
+        vector<Job> held_back;
+        unordered_set<int> try_ids;
+        const int try_n = min((int)candidates.size(), pool_cap);
+        for (int i = 0; i < try_n; ++i) {
+            to_try.push_back(candidates[perm[i]]);
+            try_ids.insert(candidates[perm[i]].job_id);
+        }
+        for (const auto &j : pool) {
+            if (!try_ids.count(j.job_id)) held_back.push_back(j);
+        }
+        pool.clear();
+
+        vector<double> reservation_scores = buildReservationScores(to_try);
+        vector<Job> deferred;
+        bool scheduled_one = false;
+
+        for (const auto &job : to_try) {
+            PlacementPick pick = chooseWaitOptPlacement(
+                job, sim_machines, current_time, reservation_scores);
+            if (pick.machine_index < 0) {
+                deferred.push_back(job);
+                continue;
+            }
+            long long start_t = sim_machines[pick.machine_index].earliestFeasibleStart(
+                job, pick.gpu_used, current_time);
+            if (start_t > LLONG_MAX / 8) {
+                deferred.push_back(job);
+                continue;
+            }
+            auto result = sim_machines[pick.machine_index].startJob(
+                job, start_t, pick.gpu_used);
+            records[job.job_id] = result.first;
+            running_heap.push(FinishEvent{result.second.finish_time, result.second.server_id,
+                                         result.second.job_id, result.second});
+            scheduled_one = true;
+        }
+        deferred.insert(deferred.end(), held_back.begin(), held_back.end());
+        pool = std::move(deferred);
+
+        if (scheduled_one && !pool.empty()) {
+            if (++spin_rounds < spin_cap) continue;
+            spin_rounds = 0;
+        } else {
+            spin_rounds = 0;
+        }
+
+        vector<long long> time_candidates;
+        if (next_job_index < (int)jobs.size())
+            time_candidates.push_back(jobs[next_job_index].release_time);
+        if (!running_heap.empty())
+            time_candidates.push_back(running_heap.top().finish_time);
+        long long next_t = -1;
+        for (long long c : time_candidates)
+            if (c > current_time && (next_t == -1 || c < next_t)) next_t = c;
+        if (next_t == -1) break;
+        current_time = next_t;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+    return sol;
+}
+
+GreedyScheduler::Solution GreedyScheduler::runMegascaleWaitHybridPipeline(int strategy_seed) {
+    Solution online = generateMegascaleOnlineWaitList(strategy_seed);
+    if (online.records.size() != jobs.size()) return online;
+
+    Solution best = online;
+    computeMetrics(best);
+
+    static const int replay_modes[] = {0, 4};
+    const int n = (jobs.size() > 4500) ? 0 : (strategy_seed % 2 == 0 ? 1 : 2);
+    for (int i = 0; i < n; ++i) {
+        Solution replayed = online;
+        replayMegascaleAssignmentList(replayed, replay_modes[i]);
+        if (replayed.records.size() != jobs.size()) continue;
+        computeMetrics(replayed);
+        if (isBetterSolution(replayed, best)) best = replayed;
+    }
+    return best;
 }
 
 GreedyScheduler::Solution GreedyScheduler::polishListSchedulingPipeline(
@@ -1112,11 +2431,31 @@ void GreedyScheduler::polishMegascaleInstanceReplay(Solution &best) {
     Solution result = best;
     computeMetrics(result);
 
-    static const int variants[] = {2, 0};
-    const int n = (jobs.size() > 3000) ? 1 : 2;
+    static const int modes[] = {0, 2, 1};
+    const int n = (jobs.size() > 4800) ? 1
+        : (jobs.size() > 4000) ? 1
+        : (jobs.size() > 3000) ? 2 : 3;
     for (int i = 0; i < n; ++i) {
         Solution alt = best;
-        replayScheduleWithOrder(alt, variants[i]);
+        replayMegascaleAssignmentList(alt, modes[i]);
+        if (alt.records.size() != jobs.size()) continue;
+        computeMetrics(alt);
+        if (isBetterSolution(alt, result)) result = alt;
+    }
+    if (jobs.size() >= 3000 && jobs.size() <= 4200 &&
+        (profile.burst_t0_ratio > 0.32 || profile.release_spread_ratio > 0.48)) {
+        Solution alt = best;
+        replayMegascaleAssignmentList(alt, 4);
+        if (alt.records.size() == jobs.size()) {
+            computeMetrics(alt);
+            if (isBetterSolution(alt, result)) result = alt;
+        }
+    }
+    static const int wspt_variants[] = {2, 0};
+    const int wn = (jobs.size() > 3000) ? 1 : 2;
+    for (int i = 0; i < wn; ++i) {
+        Solution alt = best;
+        replayScheduleWithOrder(alt, wspt_variants[i]);
         if (!isScheduleValid(alt)) continue;
         computeMetrics(alt);
         if (isBetterSolution(alt, result)) result = alt;
@@ -1125,7 +2464,7 @@ void GreedyScheduler::polishMegascaleInstanceReplay(Solution &best) {
 }
 
 GreedyScheduler::Solution GreedyScheduler::megascaleJointLNS(const Solution &initial, int max_iters) {
-    if (!isMegascaleInstance() || jobs.size() > 3200 || max_iters <= 0) return initial;
+    if (!isMegascaleInstance() || jobs.size() > 4000 || max_iters <= 0) return initial;
     if (!isScheduleValid(initial) || initial.records.empty()) return initial;
 
     Solution best = initial;
@@ -1144,8 +2483,10 @@ GreedyScheduler::Solution GreedyScheduler::megascaleJointLNS(const Solution &ini
         return ja->job_id < jb->job_id;
     });
 
-    const int pool = min((int)impact.size(), max(6, (int)(jobs.size() * 0.035)));
-    const int destroy_n = min(5, max(2, (int)(jobs.size() * 0.012)));
+    const double scale = (jobs.size() > 3200) ? 0.55 : 1.0;
+    const int pool = min((int)impact.size(),
+        max(5, (int)(jobs.size() * 0.035 * scale)));
+    const int destroy_n = min(5, max(2, (int)(jobs.size() * 0.012 * scale)));
     srand(41u + (unsigned)jobs.size() + (unsigned)max_iters);
 
     for (int iter = 0; iter < max_iters; ++iter) {
@@ -1158,6 +2499,626 @@ GreedyScheduler::Solution GreedyScheduler::megascaleJointLNS(const Solution &ini
         computeMetrics(trial);
         if (isBetterSolution(trial, best)) best = trial;
     }
+    return best;
+}
+
+GreedyScheduler::Solution GreedyScheduler::megascaleLightAssignmentRefine(
+    const Solution &initial, int max_tries) {
+    if (!isMegascaleInstance() || max_tries <= 0) return initial;
+    if (initial.records.size() != jobs.size()) return initial;
+
+    Solution best = initial;
+    computeMetrics(best);
+
+    vector<size_t> order(best.records.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    sort(order.begin(), order.end(), [this, &best](size_t a, size_t b) {
+        const Job *ja = job_by_id.count(best.records[a].job_id)
+            ? job_by_id.at(best.records[a].job_id) : nullptr;
+        const Job *jb = job_by_id.count(best.records[b].job_id)
+            ? job_by_id.at(best.records[b].job_id) : nullptr;
+        if (!ja || !jb) return a < b;
+        long long wa = (long long)ja->weight * ja->duration;
+        long long wb = (long long)jb->weight * jb->duration;
+        if (wa != wb) return wa > wb;
+        return ja->job_id < jb->job_id;
+    });
+
+    int tried = 0;
+    for (size_t idx : order) {
+        if (tried >= max_tries) break;
+        const int job_id = best.records[idx].job_id;
+        auto fm = feasible_machines.find(job_id);
+        if (fm == feasible_machines.end() || fm->second.size() <= 1) continue;
+
+        const auto &cur = best.records[idx];
+        bool improved = false;
+        const int opt_cap = (jobs.size() > 4000) ? 2 : 3;
+        int opt_tried = 0;
+        for (const auto &entry : fm->second) {
+            if (opt_tried >= opt_cap) break;
+            ++opt_tried;
+            if (entry.second == cur.gpu_used &&
+                machines[entry.first].spec.server_id == cur.server_id) {
+                continue;
+            }
+            Solution alt = best;
+            alt.records[idx].server_id = machines[entry.first].spec.server_id;
+            alt.records[idx].gpu_used = entry.second;
+            replayMegascaleAssignmentList(alt, 0);
+            if (alt.records.size() != jobs.size()) continue;
+            computeMetrics(alt);
+            if (isBetterSolution(alt, best)) {
+                best = alt;
+                improved = true;
+                break;
+            }
+        }
+        if (improved || fm->second.size() > 1) ++tried;
+    }
+    return best;
+}
+
+GreedyScheduler::Solution GreedyScheduler::refineMegascaleWaitContributors(
+    const Solution &initial, int max_tries) {
+    if (!isMegascaleInstance() || max_tries <= 0) return initial;
+    if (initial.records.size() != jobs.size()) return initial;
+
+    Solution trial = initial;
+    computeMetrics(trial);
+
+    vector<size_t> order(trial.records.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    sort(order.begin(), order.end(), [this, &trial](size_t a, size_t b) {
+        const Job *ja = job_by_id.count(trial.records[a].job_id)
+            ? job_by_id.at(trial.records[a].job_id) : nullptr;
+        const Job *jb = job_by_id.count(trial.records[b].job_id)
+            ? job_by_id.at(trial.records[b].job_id) : nullptr;
+        if (!ja || !jb) return a < b;
+        long long wa = (long long)ja->weight *
+            max(0LL, trial.records[a].start_time - ja->release_time);
+        long long wb = (long long)jb->weight *
+            max(0LL, trial.records[b].start_time - jb->release_time);
+        if (wa != wb) return wa > wb;
+        long long ia = (long long)ja->weight * ja->duration;
+        long long ib = (long long)jb->weight * jb->duration;
+        if (ia != ib) return ia > ib;
+        return ja->job_id < jb->job_id;
+    });
+
+    const int patch_cap = min(max_tries, (jobs.size() > 4200) ? 2 : 3);
+    const int opt_cap = 2;
+    int patches = 0;
+
+    for (size_t idx : order) {
+        if (patches >= patch_cap) break;
+        const int job_id = trial.records[idx].job_id;
+        const Job *job = job_by_id.count(job_id) ? job_by_id.at(job_id) : nullptr;
+        if (!job) continue;
+        const long long wait_contrib = (long long)job->weight *
+            max(0LL, trial.records[idx].start_time - job->release_time);
+        if (wait_contrib <= 0) continue;
+
+        auto fm = feasible_machines.find(job_id);
+        if (fm == feasible_machines.end() || fm->second.size() <= 1) continue;
+
+        const auto &cur = trial.records[idx];
+        int opt_tried = 0;
+        long long best_wait = wait_contrib;
+        int best_mi = -1;
+        int best_gpu = -1;
+
+        for (const auto &entry : fm->second) {
+            if (opt_tried >= opt_cap) break;
+            ++opt_tried;
+            if (entry.second == cur.gpu_used &&
+                machines[entry.first].spec.server_id == cur.server_id) {
+                continue;
+            }
+            auto mach_it = machine_index_by_id.find(machines[entry.first].spec.server_id);
+            if (mach_it == machine_index_by_id.end()) continue;
+            const MachineState &ms = machines[mach_it->second];
+            if (!ms.canEverRun(*job, entry.second)) continue;
+            long long est = ms.earliestFeasibleStart(*job, entry.second, job->release_time);
+            long long alt_wait = (long long)job->weight * max(0LL, est - job->release_time);
+            if (alt_wait < best_wait) {
+                best_wait = alt_wait;
+                best_mi = entry.first;
+                best_gpu = entry.second;
+            }
+        }
+
+        if (best_mi >= 0) {
+            trial.records[idx].server_id = machines[best_mi].spec.server_id;
+            trial.records[idx].gpu_used = best_gpu;
+            ++patches;
+        }
+    }
+
+    if (patches == 0) return initial;
+
+    replayMegascaleAssignmentList(trial, (jobs.size() > 4500) ? 0 : 4);
+    if (trial.records.size() != jobs.size()) return initial;
+    computeMetrics(trial);
+    return isBetterSolution(trial, initial) ? trial : initial;
+}
+
+GreedyScheduler::Solution GreedyScheduler::refineMegascaleSimPlacementSearch(
+    const Solution &initial, int max_tries) {
+    if (!isMegascaleInstance() || max_tries <= 0) return initial;
+    if (initial.records.size() != jobs.size()) return initial;
+
+    Solution best = initial;
+    computeMetrics(best);
+
+    vector<size_t> order(best.records.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    sort(order.begin(), order.end(), [this, &best](size_t a, size_t b) {
+        const Job *ja = job_by_id.count(best.records[a].job_id)
+            ? job_by_id.at(best.records[a].job_id) : nullptr;
+        const Job *jb = job_by_id.count(best.records[b].job_id)
+            ? job_by_id.at(best.records[b].job_id) : nullptr;
+        if (!ja || !jb) return a < b;
+        long long wa = (long long)ja->weight *
+            max(0LL, best.records[a].start_time - ja->release_time);
+        long long wb = (long long)jb->weight *
+            max(0LL, best.records[b].start_time - jb->release_time);
+        if (wa != wb) return wa > wb;
+        long long ia = (long long)ja->weight * ja->duration;
+        long long ib = (long long)jb->weight * jb->duration;
+        if (ia != ib) return ia > ib;
+        return ja->job_id < jb->job_id;
+    });
+
+    const int replay_mode = (jobs.size() > 4000) ? 5 : 4;
+    const int opts_per_job = (jobs.size() > 3800) ? 2 : 3;
+    int tried = 0;
+
+    for (size_t idx : order) {
+        if (tried >= max_tries) break;
+
+        const int job_id = best.records[idx].job_id;
+        const Job *job = job_by_id.count(job_id) ? job_by_id.at(job_id) : nullptr;
+        if (!job) continue;
+
+        const long long wait_contrib = (long long)job->weight *
+            max(0LL, best.records[idx].start_time - job->release_time);
+        const long long job_impact = (long long)job->weight * job->duration;
+        long long impact_cut = (long long)profile.avg_duration * job->weight;
+        if (jobs.size() > 0) {
+            vector<long long> impacts;
+            impacts.reserve(jobs.size());
+            for (const auto &j : jobs) {
+                impacts.push_back((long long)j.weight * j.duration);
+            }
+            nth_element(impacts.begin(),
+                impacts.begin() + impacts.size() / 2, impacts.end());
+            impact_cut = impacts[impacts.size() / 2];
+        }
+        if (wait_contrib <= 0 && job_impact < impact_cut) continue;
+
+        auto fm = feasible_machines.find(job_id);
+        if (fm == feasible_machines.end() || fm->second.size() <= 1) continue;
+
+        const auto &cur = best.records[idx];
+        struct OptEntry {
+            int mi = -1;
+            int gpu = -1;
+            long long static_wait = LLONG_MAX;
+        };
+        vector<OptEntry> opts;
+        opts.reserve(fm->second.size());
+
+        for (const auto &entry : fm->second) {
+            if (entry.first < 0 || entry.first >= (int)machines.size()) continue;
+            const MachineState &ms = machines[entry.first];
+            if (!ms.canEverRun(*job, entry.second)) continue;
+            if (entry.second == cur.gpu_used &&
+                ms.spec.server_id == cur.server_id) {
+                continue;
+            }
+            long long est = ms.earliestFeasibleStart(*job, entry.second, job->release_time);
+            OptEntry oe;
+            oe.mi = entry.first;
+            oe.gpu = entry.second;
+            oe.static_wait = (long long)job->weight * max(0LL, est - job->release_time);
+            opts.push_back(oe);
+        }
+        if (opts.empty()) continue;
+
+        sort(opts.begin(), opts.end(), [](const OptEntry &a, const OptEntry &b) {
+            return a.static_wait < b.static_wait;
+        });
+        if ((int)opts.size() > opts_per_job) opts.resize(opts_per_job);
+
+        bool improved = false;
+        for (const auto &oe : opts) {
+            Solution alt = best;
+            alt.records[idx].server_id = machines[oe.mi].spec.server_id;
+            alt.records[idx].gpu_used = oe.gpu;
+            replayMegascaleAssignmentList(alt, replay_mode);
+            if (alt.records.size() != jobs.size()) continue;
+            computeMetrics(alt);
+            if (isBetterSolution(alt, best)) {
+                best = alt;
+                improved = true;
+                break;
+            }
+        }
+        if (improved || !opts.empty()) ++tried;
+    }
+
+    return best;
+}
+
+GreedyScheduler::Solution GreedyScheduler::refineMegascalePairSwapSearch(
+    const Solution &initial, int max_pair_tries) {
+    if (!isMegascaleInstance() || max_pair_tries <= 0) return initial;
+    if (initial.records.size() != jobs.size()) return initial;
+
+    Solution best = initial;
+    computeMetrics(best);
+
+    struct SwapCandidate {
+        size_t idx = 0;
+        long long wait_contrib = 0;
+        long long impact = 0;
+    };
+    vector<SwapCandidate> pool;
+    pool.reserve(best.records.size());
+    for (size_t i = 0; i < best.records.size(); ++i) {
+        const int job_id = best.records[i].job_id;
+        const Job *job = job_by_id.count(job_id) ? job_by_id.at(job_id) : nullptr;
+        if (!job) continue;
+        SwapCandidate sc;
+        sc.idx = i;
+        sc.wait_contrib = (long long)job->weight *
+            max(0LL, best.records[i].start_time - job->release_time);
+        sc.impact = (long long)job->weight * job->duration;
+        pool.push_back(sc);
+    }
+    sort(pool.begin(), pool.end(), [](const SwapCandidate &a, const SwapCandidate &b) {
+        if (a.wait_contrib != b.wait_contrib) return a.wait_contrib > b.wait_contrib;
+        if (a.impact != b.impact) return a.impact > b.impact;
+        return a.idx < b.idx;
+    });
+
+    const int pool_size = min((int)pool.size(),
+        max(12, (int)(jobs.size() * 0.006 + 8.0 * profile.burst_t0_ratio)));
+    if ((int)pool.size() > pool_size) pool.resize(pool_size);
+
+    const int replay_mode = (jobs.size() > 4200) ? 5 : 4;
+    int tried = 0;
+
+    for (size_t pi = 0; pi < pool.size() && tried < max_pair_tries; ++pi) {
+        for (size_t pj = pi + 1; pj < pool.size() && tried < max_pair_tries; ++pj) {
+            const size_t ia = pool[pi].idx;
+            const size_t ib = pool[pj].idx;
+            const auto &rec_a = best.records[ia];
+            const auto &rec_b = best.records[ib];
+            if (rec_a.server_id == rec_b.server_id && rec_a.gpu_used == rec_b.gpu_used) {
+                continue;
+            }
+            if (!jobCanUsePlacement(rec_a.job_id, rec_b.server_id, rec_b.gpu_used) ||
+                !jobCanUsePlacement(rec_b.job_id, rec_a.server_id, rec_a.gpu_used)) {
+                continue;
+            }
+
+            ++tried;
+            Solution alt = best;
+            alt.records[ia].server_id = rec_b.server_id;
+            alt.records[ia].gpu_used = rec_b.gpu_used;
+            alt.records[ib].server_id = rec_a.server_id;
+            alt.records[ib].gpu_used = rec_a.gpu_used;
+            replayMegascaleAssignmentList(alt, replay_mode);
+            if (alt.records.size() != jobs.size()) continue;
+            computeMetrics(alt);
+            if (isBetterSolution(alt, best)) best = alt;
+        }
+    }
+
+    return best;
+}
+
+GreedyScheduler::Solution GreedyScheduler::refineMegascaleTopJobSubproblem(
+    const Solution &initial, int budget_ms) {
+    if (!isMegascaleInstance() || budget_ms <= 0) return initial;
+    if (initial.records.size() != jobs.size()) return initial;
+    if (jobs.size() < 2800 || jobs.size() > 4000) return initial;
+
+    const auto deadline = chrono::steady_clock::now() +
+        chrono::milliseconds(min(budget_ms, jobs.size() > 3700 ? 700 : 1200));
+
+    struct PlacementOpt {
+        int server_id = -1;
+        int gpu = -1;
+        long long static_wait = LLONG_MAX;
+    };
+    struct CriticalJob {
+        size_t record_idx = 0;
+        int job_id = -1;
+        vector<PlacementOpt> options;
+    };
+
+    vector<CriticalJob> critical;
+    critical.reserve(32);
+    const int top_k = (jobs.size() > 3700) ? 6 : (jobs.size() > 3400) ? 10 : 12;
+    const int opts_per_job = (jobs.size() > 3600) ? 2 : 3;
+
+    vector<size_t> order(initial.records.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    sort(order.begin(), order.end(), [this, &initial](size_t a, size_t b) {
+        const Job *ja = job_by_id.count(initial.records[a].job_id)
+            ? job_by_id.at(initial.records[a].job_id) : nullptr;
+        const Job *jb = job_by_id.count(initial.records[b].job_id)
+            ? job_by_id.at(initial.records[b].job_id) : nullptr;
+        if (!ja || !jb) return a < b;
+        long long ia = (long long)ja->weight * ja->duration;
+        long long ib = (long long)jb->weight * jb->duration;
+        if (ia != ib) return ia > ib;
+        return ja->job_id < jb->job_id;
+    });
+
+    for (size_t idx : order) {
+        if ((int)critical.size() >= top_k) break;
+        const int job_id = initial.records[idx].job_id;
+        const Job *job = job_by_id.count(job_id) ? job_by_id.at(job_id) : nullptr;
+        if (!job) continue;
+
+        auto fm = feasible_machines.find(job_id);
+        if (fm == feasible_machines.end() || fm->second.size() <= 1) continue;
+
+        CriticalJob cj;
+        cj.record_idx = idx;
+        cj.job_id = job_id;
+        vector<PlacementOpt> raw;
+        raw.reserve(fm->second.size());
+
+        for (const auto &entry : fm->second) {
+            if (entry.first < 0 || entry.first >= (int)machines.size()) continue;
+            const MachineState &ms = machines[entry.first];
+            if (!ms.canEverRun(*job, entry.second)) continue;
+            long long est = ms.earliestFeasibleStart(*job, entry.second, job->release_time);
+            if (est > LLONG_MAX / 8) continue;
+            PlacementOpt opt;
+            opt.server_id = ms.spec.server_id;
+            opt.gpu = entry.second;
+            opt.static_wait = (long long)job->weight * max(0LL, est - job->release_time);
+            raw.push_back(opt);
+        }
+        if (raw.empty()) continue;
+
+        sort(raw.begin(), raw.end(), [](const PlacementOpt &a, const PlacementOpt &b) {
+            if (a.static_wait != b.static_wait) return a.static_wait < b.static_wait;
+            if (a.server_id != b.server_id) return a.server_id < b.server_id;
+            return a.gpu < b.gpu;
+        });
+        if ((int)raw.size() > opts_per_job) raw.resize(opts_per_job);
+        cj.options = std::move(raw);
+        critical.push_back(std::move(cj));
+    }
+
+    if (critical.size() < 3) return initial;
+
+    long long best_static = LLONG_MAX;
+    vector<int> best_choice(critical.size(), 0);
+    vector<int> cur_choice(critical.size(), 0);
+    vector<long long> min_tail(critical.size(), 0);
+    for (int i = (int)critical.size() - 1; i >= 0; --i) {
+        min_tail[i] = critical[i].options[0].static_wait;
+        if (i + 1 < (int)critical.size()) min_tail[i] += min_tail[i + 1];
+    }
+
+    function<void(int, long long)> dfs = [&](int depth, long long partial) {
+        if (chrono::steady_clock::now() >= deadline) return;
+        if (partial >= best_static) return;
+        if (depth == (int)critical.size()) {
+            best_static = partial;
+            best_choice = cur_choice;
+            return;
+        }
+        const long long tail_lb = min_tail[depth];
+        if (partial + tail_lb >= best_static) return;
+        for (int oi = 0; oi < (int)critical[depth].options.size(); ++oi) {
+            cur_choice[depth] = oi;
+            dfs(depth + 1, partial + critical[depth].options[oi].static_wait);
+        }
+    };
+    dfs(0, 0);
+
+    if (best_static >= LLONG_MAX / 4) return initial;
+
+    struct Candidate {
+        vector<int> choice;
+        long long static_cost = 0;
+    };
+    vector<Candidate> candidates;
+    candidates.push_back({best_choice, best_static});
+
+    long long second_best = LLONG_MAX;
+    vector<int> second_choice;
+    function<void(int, long long)> dfs_second = [&](int depth, long long partial) {
+        if (chrono::steady_clock::now() >= deadline) return;
+        if (partial >= second_best || partial >= best_static) return;
+        if (depth == (int)critical.size()) {
+            bool same = true;
+            for (size_t i = 0; i < critical.size(); ++i) {
+                if (cur_choice[i] != best_choice[i]) { same = false; break; }
+            }
+            if (same) return;
+            second_best = partial;
+            second_choice = cur_choice;
+            return;
+        }
+        const long long tail_lb = min_tail[depth];
+        if (partial + tail_lb >= second_best || partial + tail_lb >= best_static) return;
+        for (int oi = 0; oi < (int)critical[depth].options.size(); ++oi) {
+            cur_choice[depth] = oi;
+            dfs_second(depth + 1, partial + critical[depth].options[oi].static_wait);
+        }
+    };
+    dfs_second(0, 0);
+    if (second_best < LLONG_MAX / 4 && candidates.size() < 2 &&
+        chrono::steady_clock::now() < deadline) {
+        candidates.push_back({second_choice, second_best});
+    }
+
+    Solution best = initial;
+    computeMetrics(best);
+    const int replay_mode = (jobs.size() > 4200) ? 5 : 4;
+
+    for (const auto &cand : candidates) {
+        if (chrono::steady_clock::now() >= deadline) break;
+        Solution trial = initial;
+        for (size_t i = 0; i < critical.size(); ++i) {
+            const auto &opt = critical[i].options[cand.choice[i]];
+            trial.records[critical[i].record_idx].server_id = opt.server_id;
+            trial.records[critical[i].record_idx].gpu_used = opt.gpu;
+        }
+        replayMegascaleAssignmentList(trial, replay_mode);
+        if (trial.records.size() != jobs.size()) continue;
+        computeMetrics(trial);
+        if (isBetterSolution(trial, best)) best = trial;
+    }
+
+    return best;
+}
+
+bool GreedyScheduler::megascaleAnytimeExpired(
+    chrono::steady_clock::time_point deadline) const {
+    return chrono::steady_clock::now() >= deadline;
+}
+
+bool GreedyScheduler::megascaleTryBatchWaitPatch(
+    Solution &best, int replay_mode, const vector<size_t> &order,
+    size_t &cursor, int max_patches) {
+    if (order.empty() || max_patches <= 0) return false;
+
+    Solution trial = best;
+    const int opt_cap = 2;
+    int patches = 0;
+
+    for (int attempt = 0; attempt < max_patches && cursor < order.size(); ++attempt) {
+        const size_t idx = order[cursor++];
+        const int job_id = trial.records[idx].job_id;
+        const Job *job = job_by_id.count(job_id) ? job_by_id.at(job_id) : nullptr;
+        if (!job) continue;
+
+        const long long wait_contrib = (long long)job->weight *
+            max(0LL, trial.records[idx].start_time - job->release_time);
+        if (wait_contrib <= 0) continue;
+
+        auto fm = feasible_machines.find(job_id);
+        if (fm == feasible_machines.end() || fm->second.size() <= 1) continue;
+
+        const auto &cur = trial.records[idx];
+        int opt_tried = 0;
+        long long best_wait = wait_contrib;
+        int best_mi = -1;
+        int best_gpu = -1;
+
+        for (const auto &entry : fm->second) {
+            if (opt_tried >= opt_cap) break;
+            ++opt_tried;
+            if (entry.second == cur.gpu_used &&
+                machines[entry.first].spec.server_id == cur.server_id) {
+                continue;
+            }
+            auto mach_it = machine_index_by_id.find(machines[entry.first].spec.server_id);
+            if (mach_it == machine_index_by_id.end()) continue;
+            const MachineState &ms = machines[mach_it->second];
+            if (!ms.canEverRun(*job, entry.second)) continue;
+            long long est = ms.earliestFeasibleStart(*job, entry.second, job->release_time);
+            long long alt_wait = (long long)job->weight * max(0LL, est - job->release_time);
+            if (alt_wait < best_wait) {
+                best_wait = alt_wait;
+                best_mi = entry.first;
+                best_gpu = entry.second;
+            }
+        }
+
+        if (best_mi >= 0) {
+            trial.records[idx].server_id = machines[best_mi].spec.server_id;
+            trial.records[idx].gpu_used = best_gpu;
+            ++patches;
+        }
+    }
+
+    if (patches == 0) return false;
+
+    replayMegascaleAssignmentList(trial, replay_mode);
+    if (trial.records.size() != jobs.size()) return false;
+    computeMetrics(trial);
+    if (isBetterSolution(trial, best)) {
+        best = trial;
+        return true;
+    }
+    return false;
+}
+
+GreedyScheduler::Solution GreedyScheduler::megascaleAnytimeImprove(
+    Solution best, chrono::steady_clock::time_point deadline) {
+    if (!isMegascaleInstance() || !isScheduleValid(best)) return best;
+
+    const auto now = chrono::steady_clock::now();
+    if (now >= deadline) return best;
+    const int remaining_ms = (int)chrono::duration_cast<chrono::milliseconds>(
+        deadline - now).count();
+    if (remaining_ms < 900) return best;
+
+    computeMetrics(best);
+
+    if (!megascaleAnytimeExpired(deadline) && jobs.size() > 2800 && remaining_ms >= 1400) {
+        Solution alt = best;
+        replayMegascaleAssignmentList(alt, 5);
+        if (alt.records.size() == jobs.size()) {
+            computeMetrics(alt);
+            if (isBetterSolution(alt, best)) best = alt;
+        }
+    }
+
+    if (remaining_ms < 1800 || jobs.size() > 4800) return best;
+
+    vector<size_t> order(best.records.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    const int top_k = min((int)order.size(),
+        max(16, (int)(jobs.size() * 0.012)));
+    sort(order.begin(), order.end(), [this, &best](size_t a, size_t b) {
+        const Job *ja = job_by_id.count(best.records[a].job_id)
+            ? job_by_id.at(best.records[a].job_id) : nullptr;
+        const Job *jb = job_by_id.count(best.records[b].job_id)
+            ? job_by_id.at(best.records[b].job_id) : nullptr;
+        if (!ja || !jb) return a < b;
+        long long wa = (long long)ja->weight *
+            max(0LL, best.records[a].start_time - ja->release_time);
+        long long wb = (long long)jb->weight *
+            max(0LL, best.records[b].start_time - jb->release_time);
+        if (wa != wb) return wa > wb;
+        long long ia = (long long)ja->weight * ja->duration;
+        long long ib = (long long)jb->weight * jb->duration;
+        if (ia != ib) return ia > ib;
+        return ja->job_id < jb->job_id;
+    });
+    if ((int)order.size() > top_k) order.resize(top_k);
+
+    const int replay_mode = (jobs.size() > 4200) ? 5 : 4;
+    const int patch_per_round = (jobs.size() > 4000) ? 2 : 3;
+    const int max_batch_rounds = remaining_ms >= 5000 ? 3 : (remaining_ms >= 3000 ? 2 : 1);
+    size_t cursor = 0;
+    int stale_rounds = 0;
+    int batch_rounds = 0;
+    const int stale_cap = 2;
+
+    while (!megascaleAnytimeExpired(deadline) && stale_rounds < stale_cap &&
+           cursor < order.size() && batch_rounds < max_batch_rounds) {
+        if (megascaleTryBatchWaitPatch(best, replay_mode, order, cursor, patch_per_round)) {
+            stale_rounds = 0;
+            ++batch_rounds;
+        } else {
+            ++stale_rounds;
+        }
+    }
+
     return best;
 }
 
@@ -1317,18 +3278,53 @@ GreedyScheduler::Solution GreedyScheduler::generateMegascaleDedicatedSolution() 
         if (max_replays > 0) consider(polishListSchedulingPipeline(list, max_replays));
     };
 
+    auto consider_wait = [&](int seed, int max_replays) {
+        Solution w = generateMegascaleWaitOptAssignment(seed, max_replays);
+        if (w.records.size() == jobs.size()) consider(w);
+    };
+
     const int static_replay = (jobs.size() > 3200) ? 0 : 1;
-    consider(generateStaticAssignmentSolution(881, static_replay));
-    if (jobs.size() >= 2001 && jobs.size() <= 2800) {
-        consider(generateMegascaleBalancedAssignment(882, 1));
-        consider_list(2, 1);
-    } else if (jobs.size() <= 3200) {
-        consider(generateMegascaleBalancedAssignment(882, 1));
-        consider_list(2, 0);
-    } else if (jobs.size() > 3200) {
-        consider(generateStaticAssignmentSolution(880, 0));
+    if (jobs.size() <= 4000) {
+        consider(generateStaticAssignmentSolution(881, static_replay));
     }
-    consider(generateGreedySolutionWithStrategy(42, 2));
+    if (jobs.size() >= 2001 && jobs.size() <= 2800) {
+        consider_wait(884, 1);
+        consider_wait(885, 0);
+        consider(generateMegascaleBalancedAssignment(882, 1));
+        consider(generateMegascaleBalancedAssignment(883, 1));
+        consider_list(2, 1);
+    } else if (jobs.size() <= 4500) {
+        consider(generateStaticAssignmentSolution(880, static_replay));
+        consider(generateMegascaleBalancedAssignment(882, 1));
+        if (jobs.size() >= 3200 && jobs.size() <= 4200) {
+            Solution adp = generateMegascaleAdaptiveWaitAssignment(887, 0);
+            if (adp.records.size() == jobs.size()) consider(adp);
+            if (jobs.size() <= 3800 && profile.burst_t0_ratio > 0.28) {
+                Solution bal = generateMegascaleBalancedAssignment(882, 0);
+                if (bal.records.size() == jobs.size()) {
+                    consider(mergeMegascaleDualAssignment(bal, adp));
+                }
+            }
+            if (profile.burst_t0_ratio > 0.28 && profile.release_spread_ratio > 0.40) {
+                consider(generateMegascaleProfileAwareAssignment(888, 0));
+            }
+        }
+    } else if (jobs.size() >= 4600) {
+        consider(generateStaticAssignmentSolution(880, 0));
+    } else {
+        consider(generateMegascaleBalancedAssignment(882, 1));
+        consider(generateStaticAssignmentSolution(880, 0));
+        consider(generateMegascaleAdaptiveWaitAssignment(887, 0));
+        consider(generateMegascaleBalancedAssignment(883, 0));
+        consider(generateMegascaleCoreAssignment(884, 0));
+        if (profile.burst_t0_ratio > 0.22 || profile.release_spread_ratio > 0.38) {
+            consider(generateMegascaleWaveAssignReplay(880));
+            consider(generateMegascaleIntegratedTimeline(881));
+        }
+    }
+    if (jobs.size() <= 5200) {
+        consider(generateGreedySolutionWithStrategy(42, 2));
+    }
     if (jobs.size() <= 3200) {
         consider(generateGreedySolutionWithStrategy(17, 0));
     }
@@ -1614,7 +3610,6 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
     }
 
     int num_strategies = adaptiveStrategyCount();
-
     const int alns_min_jobs = 60;
     Solution runner_up;
     Solution third_place;
@@ -1622,7 +3617,9 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
 
     if (shouldUseMegascaleDedicatedPath()) {
         Solution dedicated = generateMegascaleDedicatedSolution();
-        const int greedy_n = (jobs.size() > 3200) ? 2 : min(3, num_strategies);
+        const int greedy_n = (jobs.size() >= 4600) ? 1
+            : (jobs.size() >= 3200) ? 2
+            : (jobs.size() >= 2800) ? 1 : min(3, num_strategies);
         Solution greedy = generateMultiStrategySolution(greedy_n, &runner_up, &third_place);
         initial = pickBetterSolution(dedicated, greedy);
         if (initial.records.size() != jobs.size()) {
@@ -1638,10 +3635,42 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
         }
     } else {
         initial = generateMultiStrategySolution(num_strategies, &runner_up, &third_place);
+        if (jobs.size() <= 2000 && initial.records.size() == jobs.size()) {
+            vector<Solution> pool = {initial};
+            if (isScheduleValid(runner_up) && runner_up.records.size() == jobs.size()) {
+                pool.push_back(runner_up);
+            }
+            if (pool.size() > 1) initial = pickCompositeBalancedBest(pool);
+        }
     }
 
     Solution best = initial;
     const bool use_dedicated = shouldUseAssignmentFirstMainPath();
+
+    if (shouldUseMegascaleDedicatedPath() && best.records.size() == jobs.size()) {
+        computeMetrics(best);
+        if (jobs.size() <= 4000) {
+            polishMegascaleInstanceReplay(best);
+        } else if (jobs.size() <= 4500) {
+            polishMegascaleLight(best);
+        }
+        if (jobs.size() >= 3000 && jobs.size() <= 3800 &&
+            profile.burst_t0_ratio > 0.25) {
+            Solution beamed = refineMegascaleReplayBeamSearch(best, 500);
+            if (beamed.records.size() == jobs.size() && isScheduleValid(beamed)) {
+                computeMetrics(beamed);
+                if (isBetterSolution(beamed, best)) best = beamed;
+            }
+        }
+        if (jobs.size() <= 3200 && isScheduleValid(runner_up) &&
+            runner_up.records.size() == jobs.size()) {
+            Solution merged = pickBetterSolution(best, runner_up);
+            if (isScheduleValid(merged) && merged.records.size() == jobs.size()) {
+                best = merged;
+            }
+        }
+        return best.records;
+    }
 
     if (jobs.size() <= 100 && isScheduleValid(initial)) {
         computeOfficialMetrics(best);
@@ -1756,20 +3785,6 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
 
     if (!use_dedicated && jobs.size() > 900 && jobs.size() <= 2000 && isScheduleValid(best)) {
         polishLargeInstanceReplay(best);
-    }
-
-    if (shouldUseMegascaleDedicatedPath() && isScheduleValid(best)) {
-        computeMetrics(best);
-        if (jobs.size() <= 4000) {
-            polishMegascaleInstanceReplay(best);
-        }
-        if (jobs.size() <= 3200 && isScheduleValid(runner_up) &&
-            runner_up.records.size() == jobs.size()) {
-            Solution merged = pickBetterSolution(best, runner_up);
-            if (isScheduleValid(merged) && merged.records.size() == jobs.size()) {
-                best = merged;
-            }
-        }
     }
 
     if (jobs.size() >= 80 && jobs.size() <= 120 && isScheduleValid(best)) {
@@ -1962,9 +3977,342 @@ GreedyScheduler::Solution GreedyScheduler::generateMultiStrategySolution(int num
         if (s + 1 >= min_runs && stale_rounds >= early_stop_after) break;
     }
 
+    addQueueStrategyCandidates(best_sol, second_sol, third_place);
+
+    if (!isMegascaleInstance() && jobs.size() <= 2000) {
+        vector<Solution> pool;
+        pool.push_back(best_sol);
+        if (second_sol.records.size() == jobs.size()) pool.push_back(second_sol);
+        if (third_place && third_place->records.size() == jobs.size()) pool.push_back(*third_place);
+        if (pool.size() > 1) best_sol = pickCompositeBalancedBest(pool);
+    }
+
     if (runner_up) *runner_up = second_sol;
     if (third_place) *third_place = third_sol;
     return best_sol;
+}
+
+GreedyScheduler::Solution GreedyScheduler::generateQueueCandidate(
+    double duration_exp, double age_w, double flex_w, double slack_w, double waste_w,
+    double mem_trade_ratio, double cost_premium_ratio, bool use_backfill) const {
+    Solution sol;
+    if (jobs.empty()) return sol;
+
+    struct ReadyItem {
+        int job_index = 0;
+        double priority = 0.0;
+        int feasible_count = 0;
+        int duration = 0;
+        int job_id = 0;
+        long long release_time = 0;
+        long long waiting_time = 0;
+    };
+
+    struct ReadyCompare {
+        double age_w = 0.0;
+        bool operator()(const ReadyItem &left, const ReadyItem &right) const {
+            double lp = left.priority;
+            double rp = right.priority;
+            if (age_w > 0.0) {
+                lp *= 1.0 + age_w * log(1.0 + max(0LL, left.waiting_time));
+                rp *= 1.0 + age_w * log(1.0 + max(0LL, right.waiting_time));
+            }
+            if (fabs(lp - rp) > 1e-9) return lp < rp;
+            if (left.feasible_count != right.feasible_count) {
+                return left.feasible_count > right.feasible_count;
+            }
+            if (left.duration != right.duration) return left.duration < right.duration;
+            return left.job_id > right.job_id;
+        }
+    };
+
+    vector<MachineState> sim_machines = machines;
+    vector<int> machine_flex(machines.size(), 0);
+    for (const auto &entry : feasible_machines) {
+        unordered_set<int> seen;
+        for (const auto &choice : entry.second) {
+            if (seen.insert(choice.first).second && choice.first >= 0 &&
+                choice.first < (int)machine_flex.size()) {
+                ++machine_flex[choice.first];
+            }
+        }
+    }
+
+    auto attempt_limit = [this](int ready_count) {
+        if (ready_count <= 0) return 0;
+        return min(ready_count, min(2048, max(256, (int)machines.size() * 8)));
+    };
+
+    auto try_start = [&](const Job &job, long long current_time,
+                         ScheduleRecord &record, RunningJob &running_job) {
+        auto it = feasible_machines.find(job.job_id);
+        if (it == feasible_machines.end() || it->second.empty()) return false;
+
+        int best_machine = -1;
+        int best_gpu = 0;
+        double best_cost = numeric_limits<double>::infinity();
+        double best_waste = numeric_limits<double>::infinity();
+
+        auto placement_cost = [&](int machine_index, int gpu_used, double &waste_ratio) {
+            const MachineState &machine = sim_machines[machine_index];
+            int total_mem = max(1, gpu_used) * max(1, machine.spec.gpu_memory);
+            waste_ratio = (double)(total_mem - job.gpu_memory) / max(1, total_mem);
+            double flexibility = jobs.empty() ? 0.0 :
+                (double)machine_flex[machine_index] / (double)jobs.size();
+            double slack = machine.placementSlack(job, gpu_used);
+            return flex_w * flexibility + slack_w * slack + waste_w * waste_ratio;
+        };
+
+        for (const auto &choice : it->second) {
+            int machine_index = choice.first;
+            int gpu_used = choice.second;
+            if (!sim_machines[machine_index].canStart(job, gpu_used)) continue;
+
+            double waste_ratio = 0.0;
+            double cost = placement_cost(machine_index, gpu_used, waste_ratio);
+            if (cost < best_cost - 1e-12 ||
+                (fabs(cost - best_cost) <= 1e-12 &&
+                 (waste_ratio < best_waste - 1e-12 ||
+                  (fabs(waste_ratio - best_waste) <= 1e-12 &&
+                   (best_machine < 0 ||
+                    sim_machines[machine_index].spec.server_id <
+                        sim_machines[best_machine].spec.server_id))))) {
+                best_cost = cost;
+                best_waste = waste_ratio;
+                best_machine = machine_index;
+                best_gpu = gpu_used;
+            }
+        }
+
+        if (best_machine < 0) return false;
+
+        if (mem_trade_ratio < 1e50) {
+            int alt_machine = -1;
+            int alt_gpu = 0;
+            double alt_waste = numeric_limits<double>::infinity();
+            for (const auto &choice : it->second) {
+                int machine_index = choice.first;
+                int gpu_used = choice.second;
+                if (machine_index == best_machine ||
+                    !sim_machines[machine_index].canStart(job, gpu_used)) {
+                    continue;
+                }
+                double waste_ratio = 0.0;
+                double cost = placement_cost(machine_index, gpu_used, waste_ratio);
+                if (waste_ratio < best_waste * mem_trade_ratio - 1e-12 &&
+                    cost <= best_cost * cost_premium_ratio + 1e-12 &&
+                    waste_ratio < alt_waste - 1e-12) {
+                    alt_machine = machine_index;
+                    alt_gpu = gpu_used;
+                    alt_waste = waste_ratio;
+                }
+            }
+            if (alt_machine >= 0) {
+                best_machine = alt_machine;
+                best_gpu = alt_gpu;
+            }
+        }
+
+        auto started = sim_machines[best_machine].startJob(job, current_time, best_gpu);
+        record = started.first;
+        running_job = started.second;
+        return true;
+    };
+
+    long long current_time = jobs.front().release_time;
+    int next_job_index = 0;
+    priority_queue<ReadyItem, vector<ReadyItem>, ReadyCompare> pending_jobs(ReadyCompare{age_w});
+    unordered_map<int, ScheduleRecord> records;
+    priority_queue<FinishEvent, vector<FinishEvent>, greater<FinishEvent>> running_heap;
+
+    while ((int)records.size() < (int)jobs.size()) {
+        while (!running_heap.empty() && running_heap.top().finish_time <= current_time) {
+            FinishEvent event = running_heap.top();
+            running_heap.pop();
+            auto it = machine_index_by_id.find(event.server_id);
+            if (it != machine_index_by_id.end()) {
+                sim_machines[it->second].releaseJob(event.running_job);
+            }
+        }
+
+        while (next_job_index < (int)jobs.size() &&
+               jobs[next_job_index].release_time <= current_time) {
+            const Job &job = jobs[next_job_index];
+            auto feasible_it = feasible_machines.find(job.job_id);
+            int feasible_count = feasible_it != feasible_machines.end()
+                ? (int)feasible_it->second.size() : 0;
+            double priority = 1000000.0 * (double)job.weight /
+                pow((double)max(1, job.duration), duration_exp);
+            pending_jobs.push(ReadyItem{next_job_index, priority, feasible_count, job.duration,
+                                        job.job_id, job.release_time, 0});
+            ++next_job_index;
+        }
+
+        const int limit = attempt_limit((int)pending_jobs.size());
+        vector<ReadyItem> deferred;
+        deferred.reserve(limit);
+        bool scheduled_one = false;
+
+        for (int attempt = 0; attempt < limit && !pending_jobs.empty(); ++attempt) {
+            ReadyItem ready = pending_jobs.top();
+            pending_jobs.pop();
+            const Job &job = jobs[ready.job_index];
+            if (records.count(job.job_id)) continue;
+
+            ScheduleRecord record;
+            RunningJob running_job;
+            if (try_start(job, current_time, record, running_job)) {
+                records[job.job_id] = record;
+                running_heap.push(FinishEvent{running_job.finish_time, running_job.server_id,
+                                              running_job.job_id, running_job});
+                scheduled_one = true;
+            } else {
+                deferred.push_back(ready);
+            }
+        }
+
+        if (use_backfill && !deferred.empty()) {
+            vector<ReadyItem> still_deferred;
+            still_deferred.reserve(deferred.size());
+            for (const ReadyItem &ready : deferred) {
+                const Job &job = jobs[ready.job_index];
+                if (records.count(job.job_id)) continue;
+                ScheduleRecord record;
+                RunningJob running_job;
+                if (try_start(job, current_time, record, running_job)) {
+                    records[job.job_id] = record;
+                    running_heap.push(FinishEvent{running_job.finish_time, running_job.server_id,
+                                                  running_job.job_id, running_job});
+                    scheduled_one = true;
+                } else {
+                    still_deferred.push_back(ready);
+                }
+            }
+            deferred = std::move(still_deferred);
+        }
+
+        for (ReadyItem ready : deferred) {
+            ready.waiting_time = current_time - ready.release_time;
+            pending_jobs.push(ready);
+        }
+
+        if ((int)records.size() == (int)jobs.size()) break;
+        if (scheduled_one) continue;
+
+        long long next_time = -1;
+        if (next_job_index < (int)jobs.size() &&
+            jobs[next_job_index].release_time > current_time) {
+            next_time = jobs[next_job_index].release_time;
+        }
+        if (!running_heap.empty() && running_heap.top().finish_time > current_time &&
+            (next_time == -1 || running_heap.top().finish_time < next_time)) {
+            next_time = running_heap.top().finish_time;
+        }
+        if (next_time == -1) break;
+        current_time = next_time;
+    }
+
+    sol.records.reserve(records.size());
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+    return sol;
+}
+
+GreedyScheduler::Solution GreedyScheduler::pickCompositeBalancedBest(
+    vector<Solution> candidates) const {
+    vector<Solution> valid;
+    valid.reserve(candidates.size());
+    for (auto sol : candidates) {
+        if (sol.records.size() != jobs.size()) continue;
+        if (jobs.size() <= 2000) {
+            computeOfficialMetrics(sol);
+            if (!isScheduleValid(sol)) continue;
+        } else {
+            computeMetrics(sol);
+        }
+        valid.push_back(std::move(sol));
+    }
+    if (valid.empty()) return candidates.empty() ? Solution{} : candidates.front();
+    if (valid.size() == 1) return valid.front();
+
+    const double w_wait = 1.25;
+    const double w_mem = 1.0;
+    const double w_fin = 1.0;
+    double min_wait = numeric_limits<double>::infinity();
+    double max_wait = -numeric_limits<double>::infinity();
+    double min_mem = numeric_limits<double>::infinity();
+    double max_mem = -numeric_limits<double>::infinity();
+    double min_fin = numeric_limits<double>::infinity();
+    double max_fin = -numeric_limits<double>::infinity();
+
+    for (const auto &sol : valid) {
+        min_wait = min(min_wait, sol.weighted_waiting);
+        max_wait = max(max_wait, sol.weighted_waiting);
+        min_mem = min(min_mem, sol.vram_idle);
+        max_mem = max(max_mem, sol.vram_idle);
+        min_fin = min(min_fin, sol.makespan);
+        max_fin = max(max_fin, sol.makespan);
+    }
+
+    auto normalized = [](double value, double low, double high) {
+        return high > low ? (value - low) / (high - low) : 0.0;
+    };
+
+    int best_idx = 0;
+    double best_score = numeric_limits<double>::infinity();
+    for (int i = 0; i < (int)valid.size(); ++i) {
+        const auto &sol = valid[i];
+        double score =
+            w_wait * normalized(sol.weighted_waiting, min_wait, max_wait) +
+            w_mem * normalized(sol.vram_idle, min_mem, max_mem) +
+            w_fin * normalized(sol.makespan, min_fin, max_fin);
+        if (score < best_score - 1e-12) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    return valid[best_idx];
+}
+
+void GreedyScheduler::addQueueStrategyCandidates(Solution &best_sol, Solution &second_sol,
+                                                 Solution *third_sol) {
+    if (jobs.size() > 4700 || profile.vram_pressure >= 40.0) return;
+    if (isMegascaleInstance() && jobs.size() > 2000) return;
+
+    auto ingest = [&](Solution sol) {
+        if (sol.records.size() != jobs.size()) return;
+        if (jobs.size() <= 2000) {
+            computeOfficialMetrics(sol);
+            if (!isScheduleValid(sol)) return;
+        } else {
+            computeMetrics(sol);
+        }
+        if (isBetterSolution(sol, best_sol)) {
+            if (third_sol) *third_sol = second_sol;
+            second_sol = best_sol;
+            best_sol = std::move(sol);
+        } else if (isBetterSolution(sol, second_sol)) {
+            if (third_sol) *third_sol = second_sol;
+            second_sol = std::move(sol);
+        } else if (third_sol && isBetterSolution(sol, *third_sol)) {
+            *third_sol = std::move(sol);
+        }
+    };
+
+    if (jobs.size() <= 2000) {
+        ingest(generateQueueCandidate(1.0, 0.0, 2.0, 0.60, 0.25, 1e100, 1.0, false));
+        ingest(generateQueueCandidate(1.0, 0.0, 2.0, 0.00, 0.25, 1.00, 2.00, true));
+        ingest(generateQueueCandidate(1.0, 0.4, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+        ingest(generateQueueCandidate(1.0, 0.2, 2.0, 0.20, 0.25, 1.00, 1.50, true));
+        ingest(generateQueueCandidate(0.9, 0.3, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+    } else if (jobs.size() < 4700) {
+        ingest(generateQueueCandidate(1.0, 0.4, 2.0, 0.00, 0.25, 1.00, 1.50, true));
+        if (jobs.size() < 3000 || profile.long_job_ratio < 0.30) {
+            ingest(generateQueueCandidate(1.0, 0.0, 2.0, 0.00, 0.25, 1.00, 2.00, true));
+        }
+    }
 }
 
 GreedyScheduler::Solution GreedyScheduler::generateGreedySolutionWithStrategy(int strategy_seed,
@@ -2235,6 +4583,9 @@ GreedyScheduler::Solution GreedyScheduler::generateDedicatedSingleServerSolution
 
 GreedyScheduler::Solution GreedyScheduler::runAssignmentFirstPipeline(
     const Solution &assignment_source, int max_replays) {
+    if (isMegascaleInstance() && jobs.size() > 2000) {
+        return runMegascaleAssignmentFirstPipeline(assignment_source, max_replays);
+    }
     Solution best = assignment_source;
     if (!isScheduleValid(assignment_source) || assignment_source.records.empty()) {
         return best;
@@ -2260,6 +4611,200 @@ GreedyScheduler::Solution GreedyScheduler::runAssignmentFirstPipeline(
                 continue;
             }
         }
+        computeMetrics(alt);
+        if (isBetterSolution(alt, best)) best = alt;
+    }
+    return best;
+}
+
+void GreedyScheduler::replayMegascaleAssignmentList(Solution &sol, int sort_mode) {
+    if (sol.records.empty()) return;
+
+    unordered_map<int, pair<int, int>> assignment;
+    for (const auto &rec : sol.records) {
+        assignment[rec.job_id] = {rec.server_id, rec.gpu_used};
+    }
+
+    priority_queue<FinishEvent, vector<FinishEvent>, greater<FinishEvent>> running_heap;
+    vector<MachineState> sim_machines = machines;
+    unordered_map<int, ScheduleRecord> records;
+
+    int next_job_index = 0;
+    long long current_time = jobs.front().release_time;
+    vector<Job> pool;
+    int spin_rounds = 0;
+    const int spin_cap = (jobs.size() > 3500) ? 2 : 3;
+
+    auto sort_pool = [&](vector<Job> &pending) {
+        sort(pending.begin(), pending.end(),
+             [this, sort_mode, &sim_machines, &current_time](const Job &a, const Job &b) {
+            if (sort_mode == 0) {
+                long long wa = (long long)a.weight * a.duration;
+                long long wb = (long long)b.weight * b.duration;
+                if (wa != wb) return wa > wb;
+            } else if (sort_mode == 1) {
+                if (a.weight != b.weight) return a.weight > b.weight;
+                if (a.duration != b.duration) return a.duration < b.duration;
+            } else if (sort_mode == 2) {
+                return jobMoreUrgentFirst(a, b, 2, current_time);
+            } else if (sort_mode == 4) {
+                long long ra = max(current_time, (long long)a.release_time);
+                long long rb = max(current_time, (long long)b.release_time);
+                long long ea = minEarliestStartForJob(a, sim_machines, current_time);
+                long long eb = minEarliestStartForJob(b, sim_machines, current_time);
+                long long da = (long long)a.weight * max(0LL, ea - ra);
+                long long db = (long long)b.weight * max(0LL, eb - rb);
+                if (da != db) return da > db;
+                long long wa = (long long)a.weight * a.duration;
+                long long wb = (long long)b.weight * b.duration;
+                if (wa != wb) return wa > wb;
+            } else if (sort_mode == 5) {
+                long long ra = max(current_time, (long long)a.release_time);
+                long long rb = max(current_time, (long long)b.release_time);
+                long long da = (long long)a.weight * max(0LL, ra - current_time);
+                long long db = (long long)b.weight * max(0LL, rb - current_time);
+                if (da != db) return da > db;
+                long long wa = (long long)a.weight * a.duration;
+                long long wb = (long long)b.weight * b.duration;
+                if (wa != wb) return wa > wb;
+            } else {
+                long long ea = minEarliestStartForJob(a, sim_machines, current_time);
+                long long eb = minEarliestStartForJob(b, sim_machines, current_time);
+                if (ea != eb) return ea < eb;
+                long long wa = (long long)a.weight * a.duration;
+                long long wb = (long long)b.weight * b.duration;
+                if (wa != wb) return wa > wb;
+            }
+            if (a.release_time != b.release_time) return a.release_time < b.release_time;
+            return a.job_id < b.job_id;
+        });
+    };
+
+    while ((int)records.size() < (int)jobs.size()) {
+        while (!running_heap.empty() && running_heap.top().finish_time <= current_time) {
+            FinishEvent event = running_heap.top();
+            running_heap.pop();
+            auto it = machine_index_by_id.find(event.server_id);
+            if (it != machine_index_by_id.end()) {
+                sim_machines[it->second].releaseJob(event.running_job);
+            }
+        }
+
+        while (next_job_index < (int)jobs.size() &&
+               jobs[next_job_index].release_time <= current_time) {
+            pool.push_back(jobs[next_job_index]);
+            ++next_job_index;
+        }
+
+        if (pool.empty()) {
+            vector<long long> candidates;
+            if (next_job_index < (int)jobs.size())
+                candidates.push_back(jobs[next_job_index].release_time);
+            if (!running_heap.empty())
+                candidates.push_back(running_heap.top().finish_time);
+            long long next_t = -1;
+            for (long long c : candidates)
+                if (c > current_time && (next_t == -1 || c < next_t)) next_t = c;
+            if (next_t == -1) break;
+            current_time = next_t;
+            continue;
+        }
+
+        const int prefilter = (jobs.size() > 2800) ? 48 : 96;
+        if ((int)pool.size() > prefilter) {
+            nth_element(pool.begin(), pool.begin() + prefilter, pool.end(),
+                        [this, &sim_machines, &current_time](const Job &a, const Job &b) {
+                long long ra = max(current_time, (long long)a.release_time);
+                long long rb = max(current_time, (long long)b.release_time);
+                long long ea = minEarliestStartForJob(a, sim_machines, current_time);
+                long long eb = minEarliestStartForJob(b, sim_machines, current_time);
+                long long da = (long long)a.weight * max(0LL, ea - ra);
+                long long db = (long long)b.weight * max(0LL, eb - rb);
+                if (da != db) return da > db;
+                long long wa = (long long)a.weight * a.duration;
+                long long wb = (long long)b.weight * b.duration;
+                if (wa != wb) return wa > wb;
+                return a.job_id < b.job_id;
+            });
+            pool.resize(prefilter);
+        }
+
+        sort_pool(pool);
+        vector<Job> deferred;
+        bool scheduled_one = false;
+
+        for (const auto &job : pool) {
+            auto assign_it = assignment.find(job.job_id);
+            if (assign_it == assignment.end()) {
+                deferred.push_back(job);
+                continue;
+            }
+            auto mach_it = machine_index_by_id.find(assign_it->second.first);
+            if (mach_it == machine_index_by_id.end()) {
+                deferred.push_back(job);
+                continue;
+            }
+            int machine_index = mach_it->second;
+            int gpu_used = assign_it->second.second;
+            if (!sim_machines[machine_index].canStart(job, gpu_used)) {
+                deferred.push_back(job);
+                continue;
+            }
+            long long start_t = sim_machines[machine_index].earliestFeasibleStart(
+                job, gpu_used, current_time);
+            auto result = sim_machines[machine_index].startJob(job, start_t, gpu_used);
+            records[job.job_id] = result.first;
+            running_heap.push(FinishEvent{result.second.finish_time, result.second.server_id,
+                                         result.second.job_id, result.second});
+            scheduled_one = true;
+        }
+        pool = std::move(deferred);
+
+        if (scheduled_one && !pool.empty()) {
+            if (++spin_rounds < spin_cap) continue;
+            spin_rounds = 0;
+        } else {
+            spin_rounds = 0;
+        }
+
+        if ((int)records.size() == (int)jobs.size()) break;
+
+        vector<long long> candidates;
+        if (next_job_index < (int)jobs.size())
+            candidates.push_back(jobs[next_job_index].release_time);
+        if (!running_heap.empty())
+            candidates.push_back(running_heap.top().finish_time);
+        long long next_t = -1;
+        for (long long c : candidates)
+            if (c > current_time && (next_t == -1 || c < next_t)) next_t = c;
+        if (next_t == -1) break;
+        current_time = next_t;
+    }
+
+    sol.records.clear();
+    for (int job_id = 1; job_id <= (int)jobs.size(); ++job_id) {
+        auto it = records.find(job_id);
+        if (it != records.end()) sol.records.push_back(it->second);
+    }
+}
+
+GreedyScheduler::Solution GreedyScheduler::runMegascaleAssignmentFirstPipeline(
+    const Solution &assignment_source, int max_replays) {
+    Solution best = assignment_source;
+    if (assignment_source.records.size() != jobs.size()) return best;
+
+    computeMetrics(best);
+    static const int modes[] = {0, 2, 1};
+    int n = 3;
+    if (jobs.size() > 3500) n = 2;
+    else if (jobs.size() <= 2800 && max_replays >= 3) n = 4;
+    if (max_replays > 0) n = min(n, max_replays);
+
+    for (int i = 0; i < n; ++i) {
+        Solution alt = assignment_source;
+        const int mode = (i < 3) ? modes[i] : 1;
+        replayMegascaleAssignmentList(alt, mode);
+        if (alt.records.size() != jobs.size()) continue;
         computeMetrics(alt);
         if (isBetterSolution(alt, best)) best = alt;
     }
@@ -2295,6 +4840,7 @@ GreedyScheduler::Solution GreedyScheduler::generateStaticAssignmentSolution(int 
     vector<long long> projected_gpu_work(machines.size(), 0);
     vector<MachineState> sim_machines = machines;
     unordered_map<int, ScheduleRecord> records;
+    const double norm = max(1.0, (double)profile.time_horizon);
 
     for (int oi : order) {
         const Job &job = jobs[oi];
@@ -2315,13 +4861,15 @@ GreedyScheduler::Solution GreedyScheduler::generateStaticAssignmentSolution(int 
                 long long est = sim_machines[mi].earliestFeasibleStart(job, gpu, job_time);
                 if (est > LLONG_MAX / 8) continue;
 
-                double cost = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
-                double norm = max(1.0, (double)profile.time_horizon);
+                double pc = placementCost(job, mi, gpu, sim_machines, est, reservation_scores);
+                double cost = pc;
                 double wait = (double)(est - job.release_time) / norm;
-                cost += 0.20 * wait * min(1.0, (double)job.weight);
+                const double wait_coef = isMegascaleInstance() ? 0.32 : 0.20;
+                const double load_coef = isMegascaleInstance() ? 0.26 : 0.22;
+                cost += wait_coef * wait * min(1.0, (double)job.weight);
                 double load = (double)projected_gpu_work[mi] /
                     max(1.0, norm * max(1, sim_machines[mi].spec.gpu_count));
-                cost += 0.22 * load * min(1.0, (double)job.weight * job.duration /
+                cost += load_coef * load * min(1.0, (double)job.weight * job.duration /
                     max(1.0, profile.avg_duration * profile.avg_duration * 50.0));
                 if (cost < best_cost - 1e-9) {
                     best_cost = cost;

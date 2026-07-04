@@ -6,6 +6,7 @@
 #include <vector>
 #include <cstdlib>
 #include <ctime>
+#include <chrono>
 
 #include "machine_state.h"
 #include "models.h"
@@ -126,6 +127,13 @@ private:
     Solution generateMultiStrategySolution(int num_strategies = 5, Solution *runner_up = nullptr,
                                            Solution *third_place = nullptr);
     Solution generateGreedySolutionWithStrategy(int strategy_seed, int order_variant_override = -1);
+    Solution generateQueueCandidate(double duration_exp, double age_w, double flex_w,
+                                    double slack_w, double waste_w,
+                                    double mem_trade_ratio, double cost_premium_ratio,
+                                    bool use_backfill) const;
+    Solution pickCompositeBalancedBest(std::vector<Solution> candidates) const;
+    void addQueueStrategyCandidates(Solution &best_sol, Solution &second_sol,
+                                    Solution *third_sol);
     Solution generateDedicatedSingleServerSolution(int strategy_seed);
     Solution generateSingleServerShelfSolution(int strategy_seed);
     Solution refinePlacement(const Solution &initial_solution, int max_passes_override = -1);
@@ -163,12 +171,28 @@ private:
     Solution generateSingleServerDedicatedSolution();
     Solution generateMemBoundDedicatedSolution();
     Solution generateMegascaleDedicatedSolution();
+    Solution generateMegascaleWaveDispatchScheduler(int policy_seed = 0);
+    Solution generateMegascaleUnifiedSolution();
+    void polishMegascaleLight(Solution &best);
     Solution generateCriticalRatioSolution(int strategy_seed);
     Solution generatePlacementFirstSolution(int strategy_seed);
     Solution generateListSchedulingSolution(int strategy_seed);
     Solution generateListSchedulingSolutionFast(int strategy_seed);
     Solution generateMegascaleCriticalRatioList(int strategy_seed);
     Solution generateMegascaleBalancedAssignment(int strategy_seed, int max_replays = 1);
+    Solution generateMegascaleWaitOptAssignment(int strategy_seed, int max_replays = 1);
+    Solution generateMegascaleAdaptiveWaitAssignment(int strategy_seed, int max_replays = 1);
+    Solution generateMegascaleProfileAwareAssignment(int strategy_seed, int max_replays = 1);
+    Solution generateMegascaleCoreAssignment(int strategy_seed, int max_replays = 1);
+    Solution generateMegascaleBurstWaveAssignment(int strategy_seed, int max_replays = 1);
+    Solution mergeMegascaleDualAssignment(const Solution &balanced_src,
+                                          const Solution &adaptive_src);
+    Solution generateMegascaleOnlineWaitList(int strategy_seed);
+    Solution runMegascaleWaitHybridPipeline(int strategy_seed);
+    PlacementPick chooseWaitOptPlacement(const Job &job,
+                                          const std::vector<MachineState> &sim_machines,
+                                          long long current_time,
+                                          const std::vector<double> &reservation_scores) const;
     Solution polishListSchedulingPipeline(const Solution &list_source, int max_replays = 1);
     void polishLargeInstanceReplay(Solution &best);
     void polishMegascaleInstanceReplay(Solution &best);
@@ -177,12 +201,29 @@ private:
                                      const std::unordered_set<int> &flexible_jobs) const;
     Solution jointLNS(const Solution &initial, int max_iters = 40);
     Solution megascaleJointLNS(const Solution &initial, int max_iters = 5);
+    Solution megascaleLightAssignmentRefine(const Solution &initial, int max_tries = 8);
+    Solution refineMegascaleWaitContributors(const Solution &initial, int max_tries = 12);
+    Solution refineMegascaleSimPlacementSearch(const Solution &initial, int max_tries = 6);
+    Solution refineMegascalePairSwapSearch(const Solution &initial, int max_pair_tries = 8);
+    Solution refineMegascaleReplayBeamSearch(const Solution &initial, int budget_ms = 2000);
+    Solution generateMegascaleWaveAssignReplay(int policy_seed = 0);
+    Solution generateMegascaleIntegratedTimeline(int policy_seed = 0);
+    Solution refineMegascaleTopJobSubproblem(const Solution &initial, int budget_ms = 2500);
+    Solution megascaleAnytimeImprove(Solution best,
+                                     std::chrono::steady_clock::time_point deadline);
+    bool megascaleAnytimeExpired(std::chrono::steady_clock::time_point deadline) const;
+    bool megascaleTryBatchWaitPatch(Solution &best, int replay_mode,
+                                    const std::vector<size_t> &order,
+                                    size_t &cursor, int max_patches);
     double criticalRatioPriority(const Job &job,
                                  const std::vector<MachineState> &sim_machines,
                                  long long current_time) const;
     Solution pickBetterSolution(const Solution &a, const Solution &b) const;
     Solution generateStaticAssignmentSolution(int strategy_seed, int max_replays = -1);
     Solution runAssignmentFirstPipeline(const Solution &assignment_source, int max_replays = -1);
+    void replayMegascaleAssignmentList(Solution &sol, int sort_mode);
+    Solution runMegascaleAssignmentFirstPipeline(const Solution &assignment_source,
+                                                 int max_replays = -1);
     long long minEarliestStartForJob(const Job &job,
                                      const std::vector<MachineState> &sim_machines,
                                      long long current_time) const;
@@ -199,6 +240,10 @@ private:
     double estStartPlacementAdjust(const Job &job, int machine_index, int gpu_used,
                                    const std::vector<MachineState> &sim_machines,
                                    long long current_time, bool as_cost) const;
+    std::vector<long long> buildReleaseWaveQuantiles(int buckets = 4) const;
+    int releaseWaveBucket(long long release_time,
+                          const std::vector<long long> &quantiles) const;
+    bool jobCanUsePlacement(int job_id, int server_id, int gpu_used) const;
 
     std::vector<ServerSpec> servers;
     std::vector<Job> jobs;
